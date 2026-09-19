@@ -181,9 +181,9 @@ def _resolves(base: Path, module: str, symbol: str | None) -> bool:
 _BASE = _owui_base()
 _IMPORTS = _our_owui_imports()
 
-_NEWER_THAN_OUR_FLOOR: dict[tuple[str, str], str] = {
-    ("open_webui.utils.chat_id", "NON_SAVED_CHAT_ID_PREFIXES"): "0.11.0",
-}
+# Empty while the manifest floor is the newest Open WebUI the pipe uses anything from. An entry belongs here
+# only for a symbol the pipe imports under a guard that some supported Open WebUI genuinely lacks.
+_NEWER_THAN_OUR_FLOOR: dict[tuple[str, str], str] = {}
 
 
 @pytest.mark.skipif(_BASE is None, reason="open_webui is not installed")
@@ -344,7 +344,7 @@ def test_every_declared_absence_is_actually_imported_under_a_guard() -> None:
     )
 
 
-_EXPECTED_SEAM_IMPORTS = 64
+_EXPECTED_SEAM_IMPORTS = 66
 
 
 def test_seam_checklist_covers_every_open_webui_import() -> None:
