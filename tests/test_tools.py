@@ -288,7 +288,7 @@ async def test_execute_function_calls_with_context_origin_logging():
 
             await asyncio.sleep(0.01)
 
-            queued = await asyncio.wait_for(context.queue.get(), timeout=1.0)
+            [queued] = await asyncio.wait_for(context.queue.get(), timeout=1.0)
             assert queued is not None
             assert isinstance(queued, _QueuedToolCall)
             queued.future.set_result({"type": "function_call_output", "output": "result", "call_id": "call-1", "status": "completed"})
@@ -980,42 +980,6 @@ def test_tool_executor_initialization():
         asyncio.run(pipe.close())
 
 
-@pytest.mark.asyncio
-async def test_execute_function_calls_breaker_only_skips_records_failure():
-    """Test that all calls being breaker-skipped records a failure."""
-    pipe = Pipe()
-    try:
-        pipe.valves.API_KEY = EncryptedStr("test-key")
-
-        loop = asyncio.get_running_loop()
-        context = create_tool_context(loop, user_id="breaker-test-user")
-        token = pipe._TOOL_CONTEXT.set(context)
-
-        try:
-            for _ in range(20):
-                pipe._circuit_breaker.record_tool_failure("breaker-test-user", "function", "my_tool")
-
-            async def my_tool(**kwargs):
-                return "result"
-
-            tools = {
-                "my_tool": {
-                    "type": "function",
-                    "spec": {"name": "my_tool", "parameters": {"type": "object", "properties": {}}},
-                    "callable": my_tool,
-                }
-            }
-
-            calls = [{"type": "function_call", "call_id": "call-1", "name": "my_tool", "arguments": "{}"}]
-            outputs = await pipe._ensure_tool_executor()._execute_function_calls(calls, tools)
-
-            assert len(outputs) >= 1
-        finally:
-            pipe._TOOL_CONTEXT.reset(token)
-    finally:
-        await pipe.close()
-
-
 # Edge case tests
 
 
@@ -1049,7 +1013,7 @@ async def test_execute_function_calls_with_none_arguments():
 
             outputs_task = asyncio.create_task(pipe._ensure_tool_executor()._execute_function_calls(calls, tools))
 
-            queued = await asyncio.wait_for(context.queue.get(), timeout=1.0)
+            [queued] = await asyncio.wait_for(context.queue.get(), timeout=1.0)
             assert queued is not None
             queued.future.set_result({"type": "function_call_output", "output": "done", "call_id": "call-1", "status": "completed"})
 
@@ -1173,7 +1137,7 @@ async def test_execute_function_calls_empty_args_no_required_in_context():
             outputs_task = asyncio.create_task(pipe._ensure_tool_executor()._execute_function_calls(calls, tools))
 
             # Get from queue and resolve
-            queued = await asyncio.wait_for(context.queue.get(), timeout=1.0)
+            [queued] = await asyncio.wait_for(context.queue.get(), timeout=1.0)
             assert queued is not None
             assert queued.args == {}
             queued.future.set_result({"type": "function_call_output", "output": "done", "call_id": "call-1", "status": "completed"})
@@ -1434,7 +1398,7 @@ async def test_execute_function_calls_with_dict_arguments():
             outputs_task = asyncio.create_task(pipe._ensure_tool_executor()._execute_function_calls(calls, tools))
 
             # Get from queue and resolve
-            queued = await asyncio.wait_for(context.queue.get(), timeout=1.0)
+            [queued] = await asyncio.wait_for(context.queue.get(), timeout=1.0)
             assert queued is not None
             assert queued.args == {"key": "value"}
             queued.future.set_result({"type": "function_call_output", "output": "result", "call_id": "call-1", "status": "completed"})
@@ -2950,8 +2914,9 @@ class TestBuildCollisionSafeToolSpecsAndRegistry:
         async def callable_fn(**kwargs):
             return "result"
 
+        # Open WebUI keys a tool by its spec name unless it had to rename a collision.
         owui_registry = {
-            "tool": {
+            "my_owui_tool": {
                 "spec": {"name": "my_owui_tool", "description": "Tool"},
                 "callable": callable_fn,
                 # No origin_key provided
@@ -3170,7 +3135,7 @@ def _make_queued(
 
 
 def _make_context(
-    queue: asyncio.Queue[_QueuedToolCall | None],
+    queue: asyncio.Queue[list[_QueuedToolCall] | None],
     *,
     idle_timeout: float | None = None,
     batch_cap: int = 4,
@@ -3428,706 +3393,247 @@ class TestCanBatchToolCalls:
 
 
 class TestToolWorkerLoop:
-    """Tests for _tool_worker_loop method."""
+    """The worker runs each queued batch whole, in queue order, until the stop signal.
+
+    Which calls share a batch is decided when `_execute_function_calls` queues them (TestToolCallBatching).
+    """
 
     @pytest.mark.asyncio
-    async def test_basic_single_item_execution(self) -> None:
-        """Single item should be executed and queue terminated."""
+    async def test_each_queued_batch_runs_as_one_batch_in_queue_order(self) -> None:
         worker = _DummyWorker()
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call = _make_queued(loop, "call-1", "tool_a")
-        await queue.put(call)
+        queue: asyncio.Queue[list[_QueuedToolCall] | None] = asyncio.Queue()
+        first = [_make_queued(loop, "call-1", "tool_a"), _make_queued(loop, "call-2", "tool_a")]
+        second = [_make_queued(loop, "call-3", "tool_b")]
+        await queue.put(first)
+        await queue.put(second)
         await queue.put(None)
 
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1"]]
-        assert call.future.done()
-
-    @pytest.mark.asyncio
-    async def test_batch_same_tool_name(self) -> None:
-        """Multiple calls with same name should be batched."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_a")
-        call3 = _make_queued(loop, "call-3", "tool_a")
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(call3)
-        await queue.put(None)
-
-        context = _make_context(queue, batch_cap=10)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1", "call-2", "call-3"]]
-        assert all(c.future.done() for c in [call1, call2, call3])
-
-    @pytest.mark.asyncio
-    async def test_batch_different_tools_split(self) -> None:
-        """Different tool names should create separate batches."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_a")
-        call3 = _make_queued(loop, "call-3", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(call3)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
+        await worker._tool_worker_loop(_make_context(queue))
 
         assert worker.batches == [["call-1", "call-2"], ["call-3"]]
-
-    @pytest.mark.asyncio
-    async def test_batch_cap_enforced(self) -> None:
-        """Batch cap should limit batch size."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        calls = [_make_queued(loop, f"call-{i}", "tool_a") for i in range(5)]
-        for call in calls:
-            await queue.put(call)
-        await queue.put(None)
-
-        context = _make_context(queue, batch_cap=2)
-        await worker._tool_worker_loop(context)
-
-        # Should batch in groups of 2 at most
-        assert len(worker.batches) >= 3
-
-    @pytest.mark.asyncio
-    async def test_allow_batch_false_no_batching(self) -> None:
-        """Items with allow_batch=False should not be batched."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a", allow_batch=False)
-        call2 = _make_queued(loop, "call-2", "tool_a")
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1"], ["call-2"]]
-
-    @pytest.mark.asyncio
-    async def test_idle_timeout_triggers_break(self) -> None:
-        """Idle timeout should break loop and set timeout_error."""
-        worker = _DummyWorker()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        context = _make_context(queue, idle_timeout=0.01)
-        await worker._tool_worker_loop(context)
-
-        assert context.timeout_error is not None
-        assert "idle" in context.timeout_error.lower()
-
-    @pytest.mark.asyncio
-    async def test_idle_timeout_zero_message_variant(self) -> None:
-        """Idle timeout of 0 should use alternate message."""
-        worker = _DummyWorker()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        context = _make_context(queue, idle_timeout=0.001)
-        await worker._tool_worker_loop(context)
-
-        assert context.timeout_error is not None
-
-    @pytest.mark.asyncio
-    async def test_none_idle_timeout_waits_indefinitely(self) -> None:
-        """None idle_timeout should wait for items without timeout."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call = _make_queued(loop, "call-1", "tool_a")
-
-        async def delayed_put() -> None:
-            await asyncio.sleep(0.05)
-            await queue.put(call)
-            await queue.put(None)
-
-        context = _make_context(queue, idle_timeout=None)
-
-        # Start delayed put
-        put_task = asyncio.create_task(delayed_put())
-        await worker._tool_worker_loop(context)
-        await put_task
-
-        assert context.timeout_error is None
-        assert worker.batches == [["call-1"]]
-
-    @pytest.mark.asyncio
-    async def test_none_item_terminates_with_pending(self) -> None:
-        """None item should terminate loop; pending items continue if available."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == []
-
-    @pytest.mark.asyncio
-    async def test_none_in_batch_collection_requeues(self) -> None:
-        """None encountered during batch collection should be re-added to pending."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        await queue.put(call1)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1"]]
-
-    @pytest.mark.asyncio
-    async def test_unbatchable_next_requeues_to_pending(self) -> None:
-        """Non-batchable next item should be re-added to pending."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1"], ["call-2"]]
-
-    @pytest.mark.asyncio
-    async def test_finally_cleanup_resolves_pending_futures(self) -> None:
-        """Finally block should resolve pending futures with cancellation."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        await queue.put(call1)
-
-        context = _make_context(queue, idle_timeout=0.01)
-
-        call1.future.set_result({"ok": True})
-
-        await worker._tool_worker_loop(context)
-
-        assert call1.future.done()
-
-    @pytest.mark.asyncio
-    async def test_finally_cleanup_with_undone_future(self) -> None:
-        """Finally block should set result on undone futures."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-
-        worker.execution_delay = 0.5
-
-        context = _make_context(queue, idle_timeout=0.05)
-        await worker._tool_worker_loop(context)
-
-        assert context.timeout_error is not None
-
-    @pytest.mark.asyncio
-    async def test_task_done_called_for_from_queue_items(self) -> None:
-        """task_done should be called for items from queue."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        await queue.put(call1)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
+        assert all(call.future.done() for call in [*first, *second])
         await asyncio.wait_for(queue.join(), timeout=1.0)
 
     @pytest.mark.asyncio
-    async def test_batch_with_dependent_items_splits(self) -> None:
-        """Items with dependencies should not be batched together."""
+    async def test_the_stop_signal_alone_ends_the_worker(self) -> None:
         worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a", args={})
-        call2 = _make_queued(
-            loop, "call-2", "tool_a", args={"depends_on": "call-1"}
-        )
-
-        await queue.put(call1)
-        await queue.put(call2)
+        queue: asyncio.Queue[list[_QueuedToolCall] | None] = asyncio.Queue()
         await queue.put(None)
 
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1"], ["call-2"]]
-
-    @pytest.mark.asyncio
-    async def test_empty_queue_immediate_none(self) -> None:
-        """Empty queue with immediate None should exit cleanly."""
-        worker = _DummyWorker()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
+        await worker._tool_worker_loop(_make_context(queue))
 
         assert worker.batches == []
+        await asyncio.wait_for(queue.join(), timeout=1.0)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("idle_timeout", [0.01, None])
+    async def test_a_worker_waits_for_a_batch_queued_later_whatever_the_idle_limit(self, idle_timeout) -> None:
+        worker = _DummyWorker()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[list[_QueuedToolCall] | None] = asyncio.Queue()
+        call = _make_queued(loop, "call-1", "tool_a")
+
+        async def late_batch() -> None:
+            await asyncio.sleep(0.05)
+            await queue.put([call])
+            await queue.put(None)
+
+        context = _make_context(queue, idle_timeout=idle_timeout)
+        put_task = asyncio.create_task(late_batch())
+        await asyncio.wait_for(worker._tool_worker_loop(context), timeout=2.0)
+        await put_task
+
+        assert worker.batches == [["call-1"]]
         assert context.timeout_error is None
 
     @pytest.mark.asyncio
-    async def test_multiple_batches_same_tool_cap_limit(self) -> None:
-        """Multiple items of same tool with low cap should create multiple batches."""
+    @pytest.mark.parametrize("timeout_error", [None, "Tool batch 'tool_a' exceeded 600s and was cancelled."])
+    async def test_a_batch_interrupted_by_shutdown_tells_its_unfinished_calls_why(self, timeout_error) -> None:
         worker = _DummyWorker()
+        worker.execution_delay = 0.5
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
+        queue: asyncio.Queue[list[_QueuedToolCall] | None] = asyncio.Queue()
+        calls = [_make_queued(loop, "call-1", "tool_a"), _make_queued(loop, "call-2", "tool_a")]
+        await queue.put(calls)
+        context = _make_context(queue)
+        context.timeout_error = timeout_error
 
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_a")
-        call3 = _make_queued(loop, "call-3", "tool_a")
+        task = asyncio.create_task(worker._tool_worker_loop(context))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(call3)
-        await queue.put(None)
-
-        context = _make_context(queue, batch_cap=2)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1", "call-2"], ["call-3"]]
+        expected = timeout_error or "Tool execution cancelled"
+        assert [call.future.result() for call in calls] == [
+            {"call_id": "call-1", "status": "cancelled", "message": expected},
+            {"call_id": "call-2", "status": "cancelled", "message": expected},
+        ]
+        await asyncio.wait_for(queue.join(), timeout=1.0)
 
     @pytest.mark.asyncio
-    async def test_pending_with_none_continues_processing(self) -> None:
-        """Pending None item should allow processing to continue."""
+    async def test_an_answered_call_keeps_its_answer_when_its_batch_is_interrupted(self) -> None:
         worker = _DummyWorker()
+        worker.execution_delay = 0.5
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
+        queue: asyncio.Queue[list[_QueuedToolCall] | None] = asyncio.Queue()
+        answered = _make_queued(loop, "call-1", "tool_a")
+        answered.future.set_result({"pre_set": True})
+        waiting = _make_queued(loop, "call-2", "tool_a")
+        await queue.put([answered, waiting])
 
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
+        task = asyncio.create_task(worker._tool_worker_loop(_make_context(queue)))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-        await queue.put(call1)
-        await queue.put(call2)
+        assert answered.future.result() == {"pre_set": True}
+        assert waiting.future.result() == {"call_id": "call-2", "status": "cancelled", "message": "Tool execution cancelled"}
+
+    @pytest.mark.asyncio
+    async def test_a_batch_that_raises_answers_its_unfinished_calls_and_the_error_reaches_the_caller(self) -> None:
+        class _RaisingWorker(_DummyWorker):
+            async def _execute_tool_batch(
+                self, calls: list[_QueuedToolCall], _context: _ToolExecutionContext
+            ) -> None:
+                self.batches.append([call.call.get("call_id") for call in calls])
+                calls[0].future.set_result({"ok": True})
+                raise RuntimeError("Simulated batch failure")
+
+        worker = _RaisingWorker()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[list[_QueuedToolCall] | None] = asyncio.Queue()
+        calls = [_make_queued(loop, "call-1", "tool_a"), _make_queued(loop, "call-2", "tool_a")]
+        await queue.put(calls)
         await queue.put(None)
 
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
+        with pytest.raises(RuntimeError, match="Simulated batch failure"):
+            await worker._tool_worker_loop(_make_context(queue))
 
-        # Both calls should be processed
-        assert len(worker.batches) == 2
-        assert call1.future.done()
-        assert call2.future.done()
+        assert calls[0].future.result() == {"ok": True}
+        assert calls[1].future.result() == {"call_id": "call-2", "status": "cancelled", "message": "Tool execution cancelled"}
 
     @pytest.mark.asyncio
     async def test_idle_timeout_preserves_first_error(self) -> None:
-        """Second timeout should not overwrite first timeout_error."""
-        worker = _DummyWorker()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
+        """A result wait cut by the idle limit does not overwrite an earlier timeout_error."""
+        pipe = Pipe()
+        try:
+            loop = asyncio.get_running_loop()
+            context = create_tool_context(loop, idle_timeout=0.01)
+            context.timeout_error = "First error"
+            token = pipe._TOOL_CONTEXT.set(context)
+            try:
+                async def my_tool(**_kwargs):
+                    return "result"
 
-        context = _make_context(queue, idle_timeout=0.01)
-        # Pre-set an error
-        context.timeout_error = "First error"
+                tools = {
+                    "my_tool": {
+                        "type": "function",
+                        "spec": {"name": "my_tool", "parameters": {"type": "object", "properties": {}}},
+                        "callable": my_tool,
+                    }
+                }
+                calls = [{"type": "function_call", "call_id": "call-1", "name": "my_tool", "arguments": "{}"}]
+                outputs = await pipe._ensure_tool_executor()._execute_function_calls(calls, tools)
+            finally:
+                pipe._TOOL_CONTEXT.reset(token)
+        finally:
+            await pipe.close()
 
-        await worker._tool_worker_loop(context)
-
-        # Original error should be preserved
+        assert "timed out" in outputs[0]["output"].lower()
         assert context.timeout_error == "First error"
 
-    @pytest.mark.asyncio
-    async def test_cross_reference_blocks_batch(self) -> None:
-        """Call referencing another call_id should not batch."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
 
-        call1 = _make_queued(loop, "call-1", "tool_a", args={})
-        call2 = _make_queued(
-            loop, "call-2", "tool_a", args={"ref": "result from call-1"}
+# which calls share a batch
+
+
+import json
+
+
+async def _batches_formed(monkeypatch, calls: list[tuple[str, str, dict[str, Any]]], batch_cap: int) -> list[list[str]]:
+    """Queue ``calls`` through `_execute_function_calls` with one real worker and record the batches it runs."""
+    pipe = Pipe()
+    formed: list[list[str]] = []
+
+    async def record_the_batch(batch: list[_QueuedToolCall], _context: _ToolExecutionContext) -> None:
+        formed.append([item.call["call_id"] for item in batch])
+        for item in batch:
+            item.future.set_result(
+                {"type": "function_call_output", "call_id": item.call["call_id"], "output": "ok", "status": "completed"}
+            )
+
+    async def unused_tool(**_kwargs):
+        return "ok"
+
+    monkeypatch.setattr(pipe, "_execute_tool_batch", record_the_batch)
+    tools = {
+        name: {"type": "function", "callable": unused_tool, "spec": {"name": name, "parameters": {"type": "object", "properties": {}}}}
+        for name in ("tool_a", "tool_b")
+    }
+    context = create_tool_context(asyncio.get_running_loop(), batch_cap=batch_cap)
+    executor = pipe._ensure_tool_executor()
+    context.workers.append(asyncio.create_task(executor._tool_worker_loop(context)))
+    token = pipe._TOOL_CONTEXT.set(context)
+    try:
+        await executor._execute_function_calls(
+            [
+                {"type": "function_call", "call_id": call_id, "name": name, "arguments": json.dumps(arguments)}
+                for call_id, name, arguments in calls
+            ],
+            tools,
         )
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1"], ["call-2"]]
-
-    @pytest.mark.asyncio
-    async def test_queue_empty_during_batch_breaks_inner_loop(self) -> None:
-        """QueueEmpty during batch collection should break inner loop."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        await queue.put(call1)
-        await queue.put(None)
-
-        context = _make_context(queue, batch_cap=10)
-        await worker._tool_worker_loop(context)
-
-        assert worker.batches == [["call-1"]]
+    finally:
+        pipe._TOOL_CONTEXT.reset(token)
+        await context.queue.put(None)
+        await asyncio.gather(*context.workers)
+        await pipe.close()
+    return formed
 
 
-class TestToolWorkerLoopEdgeCases:
-    """Additional edge case tests for _tool_worker_loop."""
+class TestToolCallBatching:
+    """Consecutive calls to one tool that can run together share a batch, up to the batch cap."""
 
     @pytest.mark.asyncio
-    async def test_from_queue_false_in_pending_skips_task_done(self) -> None:
-        """Items with from_queue=False should not call task_done."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
+    @pytest.mark.parametrize(
+        ("calls", "batch_cap", "expected"),
+        [
+            ([("c1", "tool_a", {}), ("c2", "tool_a", {}), ("c3", "tool_a", {})], 10, [["c1", "c2", "c3"]]),
+            ([("c1", "tool_a", {}), ("c2", "tool_a", {}), ("c3", "tool_a", {})], 2, [["c1", "c2"], ["c3"]]),
+            ([("c1", "tool_a", {}), ("c2", "tool_a", {}), ("c3", "tool_b", {})], 4, [["c1", "c2"], ["c3"]]),
+            ([("c1", "tool_a", {}), ("c2", "tool_b", {}), ("c3", "tool_a", {})], 4, [["c1"], ["c2"], ["c3"]]),
+            ([("c1", "tool_a", {"sequential": True}), ("c2", "tool_a", {})], 4, [["c1"], ["c2"]]),
+            ([("c1", "tool_a", {}), ("c2", "tool_a", {"depends_on": "c1"})], 4, [["c1"], ["c2"]]),
+            ([("c1", "tool_a", {}), ("c2", "tool_a", {"note": "use what c1 found"})], 4, [["c1"], ["c2"]]),
+            ([("c1", "tool_a", {}), ("c2", "missing", {}), ("c3", "tool_a", {})], 4, [["c1", "c3"]]),
+            (
+                [
+                    ("c1", "tool_a", {}),
+                    ("c2", "tool_a", {}),
+                    ("c3", "tool_b", {}),
+                    ("c4", "tool_b", {}),
+                    ("c5", "tool_b", {"depends_on": "c4"}),
+                ],
+                10,
+                [["c1", "c2"], ["c3", "c4"], ["c5"]],
+            ),
+        ],
+        ids=[
+            "one-tool-under-the-cap",
+            "one-tool-over-the-cap",
+            "a-second-tool-starts-a-new-batch",
+            "another-tool-between-two-calls",
+            "a-call-marked-sequential",
+            "a-call-that-depends-on-another",
+            "a-call-that-refers-to-another",
+            "a-call-answered-before-queueing-does-not-split",
+            "mixed",
+        ],
+    )
+    async def test_calls_share_a_batch_only_when_they_can_run_together(self, monkeypatch, calls, batch_cap, expected):
+        assert await _batches_formed(monkeypatch, calls, batch_cap) == expected
 
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-
-        worker.execution_delay = 0.1
-
-        context = _make_context(queue, idle_timeout=0.02)
-        await worker._tool_worker_loop(context)
-
-        assert context.timeout_error is not None
-
-    @pytest.mark.asyncio
-    async def test_none_with_from_queue_true_calls_task_done(self) -> None:
-        """None item from queue should call task_done."""
-        worker = _DummyWorker()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        await asyncio.wait_for(queue.join(), timeout=1.0)
-
-    @pytest.mark.asyncio
-    async def test_none_in_batch_collection_handled_correctly(self) -> None:
-        """None encountered during batch collection is properly handled."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        # Set up scenario:
-        # 1. First item is batchable
-        # 3. None is added to pending
-        call1 = _make_queued(loop, "call-1", "tool_a")
-
-        await queue.put(call1)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        assert context.timeout_error is None
-        assert worker.batches == [["call-1"]]
-        assert call1.future.done()
-
-    @pytest.mark.asyncio
-    async def test_already_done_future_in_finally_not_modified(self) -> None:
-        """Already-done futures in finally should not be modified."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        # Pre-set call2's future
-        original_result = {"pre_set": True}
-        call2.future.set_result(original_result)
-
-        await queue.put(call1)
-        await queue.put(call2)
-
-        worker.execution_delay = 0.3
-
-        context = _make_context(queue, idle_timeout=0.01)
-        await worker._tool_worker_loop(context)
-
-        assert call2.future.result() == original_result
-
-    @pytest.mark.asyncio
-    async def test_timeout_error_used_in_finally_message(self) -> None:
-        """timeout_error should be used in finally cancelled message."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-
-        worker.execution_delay = 0.3
-
-        context = _make_context(queue, idle_timeout=0.01)
-        await worker._tool_worker_loop(context)
-
-        # Timeout error should be set
-        assert context.timeout_error is not None
-        assert "idle" in context.timeout_error.lower()
-
-    @pytest.mark.asyncio
-    async def test_cancelled_status_in_finally_output(self) -> None:
-        """Cancelled items in finally should have cancelled status."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-
-        worker.execution_delay = 0.5
-
-        context = _make_context(queue, idle_timeout=0.01)
-        await worker._tool_worker_loop(context)
-
-        if call2.future.done():
-            result = call2.future.result()
-            if isinstance(result, dict) and "status" in result:
-                assert result["status"] in ("cancelled", "ok")
-
-
-class TestToolWorkerFinallyCleanup:
-    """Tests specifically targeting the finally cleanup block (lines 72-88)."""
-
-    @pytest.mark.asyncio
-    async def test_finally_resolves_undone_futures_on_exception(self) -> None:
-        """Finally block should resolve undone futures when exception occurs.
-
-        This test targets lines 75-82: the finally cleanup that resolves
-        leftover pending futures when the worker exits unexpectedly.
-
-        Strategy: Raise exception during batch execution while items are in pending.
-        This triggers finally with pending items having undone futures.
-        """
-
-        class _ExceptionRaisingWorker(_DummyWorker):
-            """Worker that raises on first batch execution."""
-
-            async def _execute_tool_batch(
-                self, calls: list[_QueuedToolCall], _context: _ToolExecutionContext
-            ) -> None:
-                self.batches.append([call.call.get("call_id") for call in calls])
-                # Then raise to trigger finally
-                raise RuntimeError("Simulated batch failure")
-
-        worker = _ExceptionRaisingWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(None)
-
-        context = _make_context(queue)
-
-        with pytest.raises(RuntimeError, match="Simulated batch failure"):
-            await worker._tool_worker_loop(context)
-
-
-        assert call2.future.done()
-        result = call2.future.result()
-        assert isinstance(result, dict)
-        assert result.get("status") == "cancelled"
-        assert "cancel" in result.get("message", "").lower()
-
-    @pytest.mark.asyncio
-    async def test_finally_skips_none_in_pending(self) -> None:
-        """Finally block should skip None items in pending list.
-
-        This test targets line 78-79: if leftover is None: continue
-
-        Strategy: During batch collection, encounter None which adds it to pending.
-        Then raise an exception, causing finally to process pending which includes None.
-        """
-
-        class _ExceptionAfterBatchCollectionWorker(_DummyWorker):
-            """Worker that raises after batch collection completes."""
-
-            async def _execute_tool_batch(
-                self, calls: list[_QueuedToolCall], _context: _ToolExecutionContext
-            ) -> None:
-                self.batches.append([call.call.get("call_id") for call in calls])
-                raise RuntimeError("Batch execution failed")
-
-        worker = _ExceptionAfterBatchCollectionWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-
-        await queue.put(call1)
-        await queue.put(None)
-
-        context = _make_context(queue)
-
-        with pytest.raises(RuntimeError, match="Batch execution failed"):
-            await worker._tool_worker_loop(context)
-
-
-    @pytest.mark.asyncio
-    async def test_finally_uses_default_message_when_no_timeout_error(self) -> None:
-        """Finally block should use default message when timeout_error is None.
-
-        This tests line 81: error_msg = context.timeout_error or "Tool execution cancelled"
-        """
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-
-        class _RaisingWorker(_DummyWorker):
-            async def _execute_tool_batch(self, calls: list[_QueuedToolCall], _context: _ToolExecutionContext) -> None:
-                for queued in calls:
-                    if not queued.future.done():
-                        queued.future.set_result({"ok": True})
-                raise RuntimeError("Simulated failure")
-
-        raising_worker = _RaisingWorker()
-
-        context = _make_context(queue)
-
-        with pytest.raises(RuntimeError, match="Simulated failure"):
-            await raising_worker._tool_worker_loop(context)
-
-
-    @pytest.mark.asyncio
-    async def test_finally_skips_items_from_pending_not_from_queue(self) -> None:
-        """Test that finally handles the from_queue flag correctly.
-
-        This tests line 76: if from_queue: context.queue.task_done()
-        """
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_b")
-
-        await queue.put(call1)
-        await queue.put(call2)
-
-        worker.execution_delay = 0.3
-
-        context = _make_context(queue, idle_timeout=0.02)
-        await worker._tool_worker_loop(context)
-
-        assert context.timeout_error is not None
-
-
-class TestToolWorkerIntegration:
-    """Integration-style tests for complete workflows."""
-
-    @pytest.mark.asyncio
-    async def test_complex_batch_scenario(self) -> None:
-        """Complex scenario with mixed batchable/unbatchable items."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a")
-        call2 = _make_queued(loop, "call-2", "tool_a")
-        call3 = _make_queued(loop, "call-3", "tool_b")
-        call4 = _make_queued(loop, "call-4", "tool_b")
-        call5 = _make_queued(
-            loop, "call-5", "tool_b", args={"depends_on": "call-4"}
-        )
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(call3)
-        await queue.put(call4)
-        await queue.put(call5)
-        await queue.put(None)
-
-        context = _make_context(queue, batch_cap=10)
-        await worker._tool_worker_loop(context)
-
-        # Expected batches:
-        assert len(worker.batches) >= 3
-        assert all(
-            c.future.done() for c in [call1, call2, call3, call4, call5]
-        )
-
-    @pytest.mark.asyncio
-    async def test_all_items_unbatchable(self) -> None:
-        """All items marked unbatchable should run sequentially."""
-        worker = _DummyWorker()
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-        call1 = _make_queued(loop, "call-1", "tool_a", allow_batch=False)
-        call2 = _make_queued(loop, "call-2", "tool_a", allow_batch=False)
-        call3 = _make_queued(loop, "call-3", "tool_a", allow_batch=False)
-
-        await queue.put(call1)
-        await queue.put(call2)
-        await queue.put(call3)
-        await queue.put(None)
-
-        context = _make_context(queue)
-        await worker._tool_worker_loop(context)
-
-        # Each should be its own batch
-        assert worker.batches == [["call-1"], ["call-2"], ["call-3"]]
 
 
 # ===== From test_tool_passthrough.py =====
@@ -5265,64 +4771,6 @@ def test_can_batch_tool_calls_blocks_dependencies_and_cross_refs():
         assert worker._can_batch_tool_calls(first, candidate2) is False
     finally:
         loop.close()
-
-
-@pytest.mark.asyncio
-async def test_tool_worker_batches_and_executes_separately():
-    worker = _DummyWorker2()
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-    call1 = _make_queued(loop, "call-1", "tool_a")
-    call2 = _make_queued(loop, "call-2", "tool_a")
-    call3 = _make_queued(loop, "call-3", "tool_b")
-
-    await queue.put(call1)
-    await queue.put(call2)
-    await queue.put(call3)
-    await queue.put(None)
-
-    context = _ToolExecutionContext(
-        queue=queue,
-        per_request_semaphore=asyncio.Semaphore(1),
-        global_semaphore=None,
-        timeout=5.0,
-        batch_timeout=None,
-        idle_timeout=None,
-        user_id="",
-        event_emitter=None,
-        batch_cap=4,
-    )
-
-    await worker._tool_worker_loop(context)
-
-    assert worker.batches == [["call-1", "call-2"], ["call-3"]]
-    assert call1.future.done()
-    assert call2.future.done()
-    assert call3.future.done()
-
-
-@pytest.mark.asyncio
-async def test_tool_worker_idle_timeout_sets_error():
-    worker = _DummyWorker2()
-    queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue()
-
-    context = _ToolExecutionContext(
-        queue=queue,
-        per_request_semaphore=asyncio.Semaphore(1),
-        global_semaphore=None,
-        timeout=5.0,
-        batch_timeout=None,
-        idle_timeout=0.01,
-        user_id="",
-        event_emitter=None,
-        batch_cap=4,
-    )
-
-    await worker._tool_worker_loop(context)
-
-    assert context.timeout_error is not None
-    assert "idle" in context.timeout_error.lower()
 
 
 # ===== From test_tool_exception_logging.py =====

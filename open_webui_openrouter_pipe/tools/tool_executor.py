@@ -28,6 +28,7 @@ from ..storage.persistence import generate_item_id
 if TYPE_CHECKING:
     from starlette.requests import Request
 
+    from ..core.circuit_breaker import CircuitBreaker
     from ..pipe import Pipe
 
 from ..streaming.event_emitter import EventEmitter
@@ -58,6 +59,37 @@ except Exception:
     )
     _Users = None  # type: ignore[assignment,misc]
 
+try:
+    from open_webui.utils.ask_user import (  # pyright: ignore[reportMissingImports]
+        normalize_ask_user_request as _owui_normalize_ask_user_request,
+    )
+except ImportError:
+    _owui_normalize_ask_user_request = None  # type: ignore[assignment]
+except Exception:
+    logging.getLogger(__name__).warning(
+        "open_webui.utils.ask_user failed to import for a reason other than absence; "
+        "the features that depend on it are now disabled",
+        exc_info=True,
+    )
+    _owui_normalize_ask_user_request = None  # type: ignore[assignment]
+
+try:
+    from open_webui.utils.ask_user import (  # pyright: ignore[reportMissingImports]
+        get_ask_user_tool_calls as _owui_get_ask_user_tool_calls,
+    )
+except ImportError:
+    _owui_get_ask_user_tool_calls = None  # type: ignore[assignment]
+except Exception:
+    logging.getLogger(__name__).warning(
+        "open_webui.utils.ask_user failed to import for a reason other than absence; "
+        "the features that depend on it are now disabled",
+        exc_info=True,
+    )
+    _owui_get_ask_user_tool_calls = None  # type: ignore[assignment]
+
+_ASK_USER_GRACE_SECONDS = 15.0
+_ASK_USER_NOT_ALONE = "Error: ask_user must be the only tool call, so it did not run. Call ask_user on its own."
+
 @dataclass(slots=True)
 class _QueuedToolCall:
     """Stores a pending tool call plus execution metadata for worker pools."""
@@ -66,12 +98,13 @@ class _QueuedToolCall:
     args: dict[str, Any]
     future: asyncio.Future
     allow_batch: bool
+    holds_slot: bool = False
 
 
 @dataclass(slots=True)
 class _ToolExecutionContext:
     """Holds shared state for executing tool calls within breaker limits."""
-    queue: asyncio.Queue[_QueuedToolCall | None]
+    queue: asyncio.Queue[list[_QueuedToolCall] | None]
     per_request_semaphore: asyncio.Semaphore
     global_semaphore: asyncio.Semaphore | None
     timeout: float
@@ -85,6 +118,7 @@ class _ToolExecutionContext:
     metadata: dict[str, Any] | None = None
     request_id: str = ""
     fusion_inner: bool = False
+    tool_breaker: CircuitBreaker | None = None
     tool_call_budget: int | None = None
     workers: list[asyncio.Task] = field(default_factory=list)
     timeout_error: str | None = None
@@ -118,6 +152,44 @@ class ToolExecutor:
         """
         blockers = {"depends_on", "_depends_on", "sequential", "no_batch"}
         return not any(key in args for key in blockers)
+
+    @staticmethod
+    def _is_builtin_ask_user(tool_cfg: Any) -> bool:
+        return (
+            isinstance(tool_cfg, dict)
+            and tool_cfg.get("type") == "builtin"
+            and tool_cfg.get("tool_id") == "builtin:ask_user"
+        )
+
+    def _tool_breaker(self, context: _ToolExecutionContext) -> CircuitBreaker | None:
+        return context.tool_breaker if context.fusion_inner else self._pipe._circuit_breaker
+
+    @staticmethod
+    def _tool_error_text(exc: BaseException) -> str:
+        return f"Tool error: {str(exc) or type(exc).__name__}"
+
+    def _ask_user_window(self, tool_cfg: Any, args: dict[str, Any]) -> float | None:
+        if _owui_normalize_ask_user_request is None or not self._is_builtin_ask_user(tool_cfg):
+            return None
+        try:
+            timeout_ms = _owui_normalize_ask_user_request(args)["timeout_ms"]
+        except ValueError:
+            timeout_ms = 120_000
+        return timeout_ms / 1000 + _ASK_USER_GRACE_SECONDS
+
+    def _ask_user_refusal(self, calls: list[dict], tools: dict[str, dict[str, Any]]) -> str | None:
+        is_ask_user = []
+        for call in calls:
+            name = call.get("name")
+            is_ask_user.append(self._is_builtin_ask_user(tools.get(name.strip() if isinstance(name, str) else "")))
+        if not any(is_ask_user):
+            return None
+        if _owui_get_ask_user_tool_calls is None:
+            return _ASK_USER_NOT_ALONE if len(calls) != 1 else None
+        _, refusal = _owui_get_ask_user_tool_calls(
+            [{"function": {"name": "ask_user" if flag else ""}} for flag in is_ask_user]
+        )
+        return refusal
 
     def _parse_tool_arguments(self, raw_args: Any) -> dict[str, Any]:
         """Parse raw tool arguments into a dictionary.
@@ -253,11 +325,11 @@ class ToolExecutor:
             )
 
         loop = asyncio.get_running_loop()
-        pending: list[tuple[dict[str, Any], asyncio.Future]] = []
+        pending: list[tuple[dict[str, Any], asyncio.Future, float | None]] = []
+        batches: list[list[_QueuedToolCall]] = []
         outputs: list[dict[str, Any]] = []
-        enqueued_any = False
-        breaker_only_skips = True
         _on_complete = context.on_complete
+        ask_user_refusal = self._ask_user_refusal(calls, tools)
 
         async def _append_and_notify(call: dict, result: dict) -> None:
             outputs.append(result)
@@ -269,20 +341,24 @@ class ToolExecutor:
             raw_name = call.get("name")
             tool_name = raw_name.strip() if isinstance(raw_name, str) else ""
             if not tool_name:
-                breaker_only_skips = False
                 await _append_and_notify(call, self._build_tool_output(
                     call, "Tool call missing name", status="failed",
                 ))
                 continue
             tool_cfg = tools.get(tool_name)
             if not tool_cfg:
-                breaker_only_skips = False
                 await _append_and_notify(call, self._build_tool_output(
                     call, "Tool not found", status="failed",
                 ))
                 continue
+            if ask_user_refusal and self._is_builtin_ask_user(tool_cfg):
+                await _append_and_notify(call, self._build_tool_output(
+                    call, ask_user_refusal, status="failed",
+                ))
+                continue
             tool_type = (tool_cfg.get("type") or "function").lower()
-            if not context.fusion_inner and not self._pipe._circuit_breaker.tool_allows(
+            breaker = self._tool_breaker(context)
+            if breaker is not None and not breaker.tool_allows(
                 context.user_id, tool_type, str(call.get("name") or "")
             ):
                 await self._notify_tool_breaker(context, tool_type, call.get("name"))
@@ -294,7 +370,6 @@ class ToolExecutor:
                 continue
             fn = tool_cfg.get("callable")
             if fn is None:
-                breaker_only_skips = False
                 await _append_and_notify(call, self._build_tool_output(
                     call,
                     f"Tool '{call.get('name')}' has no callable configured.",
@@ -318,13 +393,15 @@ class ToolExecutor:
                 if raw_args_value is None:
                     raw_args_value = "{}"
                 args = self._parse_tool_arguments(raw_args_value)
+                if _owui_normalize_ask_user_request is not None and self._is_builtin_ask_user(tool_cfg):
+                    with contextlib.suppress(ValueError):
+                        args = _owui_normalize_ask_user_request(args)
             except (RecursionError, ValueError) as exc:
                 self.logger.warning(
                     "Model sent unusable arguments for tool '%s'",
                     call.get("name"),
                     exc_info=True,
                 )
-                breaker_only_skips = False
                 await _append_and_notify(call, self._build_tool_output(
                     call, f"Invalid arguments: {exc}", status="failed",
                 ))
@@ -332,7 +409,6 @@ class ToolExecutor:
 
             if context.tool_call_budget is not None:
                 if context.tool_call_budget <= 0:
-                    breaker_only_skips = False
                     await _append_and_notify(call, self._build_tool_output(
                         call,
                         f"Tool '{call.get('name')}' skipped: fusion tool budget exhausted.",
@@ -350,7 +426,17 @@ class ToolExecutor:
                 future=future,
                 allow_batch=allow_batch,
             )
-            await context.queue.put(queued)
+            batch = batches[-1] if batches else None
+            if (
+                batch is not None
+                and allow_batch
+                and batch[0].allow_batch
+                and len(batch) < context.batch_cap
+                and self._can_batch_tool_calls(batch[0], queued)
+            ):
+                batch.append(queued)
+            else:
+                batches.append([queued])
             origin_source = tool_cfg.get("origin_source")
             origin_name = tool_cfg.get("origin_name")
             if isinstance(origin_source, str) and isinstance(origin_name, str):
@@ -363,44 +449,66 @@ class ToolExecutor:
                 )
             else:
                 self.logger.debug("Enqueued tool %s (batch=%s)", call.get("name"), allow_batch)
-            pending.append((call, future))
-            enqueued_any = True
-            breaker_only_skips = False
+            pending.append((call, future, self._ask_user_window(tool_cfg, args)))
 
-        if not enqueued_any and breaker_only_skips and context.user_id and not context.fusion_inner:
-            self._pipe._circuit_breaker.record_failure(context.user_id)
+        for batch in batches:
+            await context.queue.put(batch)
 
-        for call, future in pending:
-            try:
-                if context and context.idle_timeout:
-                    result = await asyncio.wait_for(future, timeout=context.idle_timeout)
-                else:
-                    result = await future
-            except TimeoutError:
+        allowance = context.idle_timeout
+        if allowance:
+            for _call, _future, window in pending:
+                if window is not None:
+                    allowance = max(allowance, window)
+        collected: dict[int, Any] = {}
+        try:
+            async with asyncio.timeout(allowance) if allowance else contextlib.nullcontext():
+                for index, (call, future, _window) in enumerate(pending):
+                    try:
+                        collected[index] = await future
+                    except TimeoutError:
+                        raise
+                    except Exception as exc:  # pragma: no cover - defensive
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self.logger.debug(
+                                "Tool '%s' raised while awaiting result (call_id=%s).",
+                                call.get("name"),
+                                call.get("call_id"),
+                                exc_info=True,
+                            )
+                        collected[index] = self._build_tool_output(
+                            call,
+                            self._tool_error_text(exc),
+                            status="failed",
+                        )
+        except TimeoutError:
+            pass
+
+        for index, (call, future, _window) in enumerate(pending):
+            result = collected.get(index)
+            if result is None and future.done() and not future.cancelled():
+                try:
+                    result = future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug(
+                            "Tool '%s' had already failed when the wait for results ended (call_id=%s).",
+                            call.get("name"),
+                            call.get("call_id"),
+                            exc_info=True,
+                        )
+                    result = self._build_tool_output(call, self._tool_error_text(exc), status="failed")
+            if result is None:
+                future.cancel()
                 tool_name = call.get("name")
-                idle_secs = context.idle_timeout if context else None
                 message = (
-                    f"Tool '{tool_name}' timed out after {idle_secs:.0f}s (idle timeout)."
-                    if idle_secs
+                    f"Tool '{tool_name}' timed out after {allowance:.0f}s (idle timeout)."
+                    if allowance
                     else "Tool idle timeout exceeded."
                 )
                 if context and not context.timeout_error:
                     context.timeout_error = message
                 self.logger.warning("Tool idle timeout: %s", message)
                 result = self._build_tool_output(call, message, status="failed")
-            except Exception as exc:  # pragma: no cover - defensive
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(
-                        "Tool '%s' raised while awaiting result (call_id=%s).",
-                        call.get("name"),
-                        call.get("call_id"),
-                        exc_info=True,
-                    )
-                result = self._build_tool_output(
-                    call,
-                    f"Tool error: {exc}",
-                    status="failed",
-                )
             if _on_complete:
                 with contextlib.suppress(Exception):
                     await _on_complete(call, result)
@@ -635,75 +743,23 @@ class ToolExecutor:
     @timed
     async def _tool_worker_loop(self, context: _ToolExecutionContext) -> None:
         """Process queued tool calls with batching/timeouts."""
-        pending: list[tuple[_QueuedToolCall | None, bool]] = []
-        batch_cap = context.batch_cap
-        idle_timeout = context.idle_timeout
-        try:
-            while True:
-                if pending:
-                    item, from_queue = pending.pop(0)
-                else:
-                    try:
-                        get_coro = context.queue.get()
-                        queued = (
-                            await get_coro
-                            if idle_timeout is None
-                            else await asyncio.wait_for(get_coro, timeout=idle_timeout)
+        while True:
+            batch = await context.queue.get()
+            try:
+                if batch is None:
+                    return
+                await self._pipe._execute_tool_batch(batch, context)
+            finally:
+                for leftover in batch or ():
+                    if not leftover.future.done():
+                        leftover.future.set_result(
+                            self._build_tool_output(
+                                leftover.call,
+                                context.timeout_error or "Tool execution cancelled",
+                                status="cancelled",
+                            )
                         )
-                    except TimeoutError:
-                        message = (
-                            f"Tool queue idle for {idle_timeout:.0f}s; cancelling pending work."
-                            if idle_timeout
-                            else "Tool queue idle timeout triggered."
-                        )
-                        context.timeout_error = context.timeout_error or message
-                        self.logger.warning("%s", message)
-                        break
-                    item, from_queue = queued, True
-                if item is None:
-                    if from_queue:
-                        context.queue.task_done()
-                    if pending:
-                        continue
-                    break
-
-                batch: list[tuple[_QueuedToolCall, bool]] = [(item, from_queue)]
-                if item.allow_batch:
-                    while len(batch) < batch_cap:
-                        try:
-                            nxt = context.queue.get_nowait()
-                            from_queue_next = True
-                        except asyncio.QueueEmpty:
-                            break
-                        if nxt is None:
-                            pending.insert(0, (None, True))
-                            break
-                        if nxt.allow_batch and self._can_batch_tool_calls(batch[0][0], nxt):
-                            batch.append((nxt, from_queue_next))
-                        else:
-                            pending.insert(0, (nxt, from_queue_next))
-                            break
-
-                await self._pipe._execute_tool_batch([itm for itm, _ in batch], context)
-                for _, flag in batch:
-                    if flag:
-                        context.queue.task_done()
-        finally:
-            while pending:
-                leftover, from_queue = pending.pop(0)
-                if from_queue:
-                    context.queue.task_done()
-                if leftover is None:
-                    continue
-                if not leftover.future.done():
-                    error_msg = context.timeout_error or "Tool execution cancelled"
-                    leftover.future.set_result(
-                        self._build_tool_output(
-                            leftover.call,
-                            error_msg,
-                            status="cancelled",
-                        )
-                    )
+                context.queue.task_done()
 
     def _can_batch_tool_calls(self, first: _QueuedToolCall, candidate: _QueuedToolCall) -> bool:
         """Check if two tool calls can be batched together."""

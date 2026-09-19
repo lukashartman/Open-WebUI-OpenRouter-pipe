@@ -125,6 +125,7 @@ from .core.utils import (
     _await_if_needed,
     _extract_feature_flags,
     _render_error_template,
+    brings_tool_results,
 )
 from .core.warn_latch import warn_level
 
@@ -225,6 +226,9 @@ class _LifecycleRegistry:
         with self._lock:
             ref = self._current.get(pipe_id)
             return ref() if ref else None
+
+
+_brings_tool_results = brings_tool_results
 
 
 def _fallback_tool_text(raw_result: Any) -> str:
@@ -1386,7 +1390,15 @@ class Pipe:
                     level="warning",
                 )
 
-            if not self._circuit_breaker.allows(user_id):
+            breaker = self._circuit_breaker
+            if breaker.threshold != valves.BREAKER_MAX_FAILURES:
+                breaker.threshold = valves.BREAKER_MAX_FAILURES
+            if breaker.window_seconds != valves.BREAKER_WINDOW_SECONDS:
+                breaker.window_seconds = valves.BREAKER_WINDOW_SECONDS
+            self._artifact_store.configure_breaker(
+                valves.BREAKER_MAX_FAILURES, valves.BREAKER_WINDOW_SECONDS, valves.BREAKER_HISTORY_SIZE
+            )
+            if not breaker.allows(user_id) and not _brings_tool_results(body):
                 message = "Temporarily disabled due to repeated errors. Please retry later."
                 if safe_event_emitter:
                     await self._event_emitter_handler._emit_notification(safe_event_emitter, message, level="warning")
@@ -2113,7 +2125,7 @@ class Pipe:
                 tokens.append(
                     (ModelFamily._PIPE_ID, ModelFamily._PIPE_ID.set(self.id))
                 )
-                tool_queue: asyncio.Queue[_QueuedToolCall | None] = asyncio.Queue(maxsize=50)
+                tool_queue: asyncio.Queue[list[_QueuedToolCall] | None] = asyncio.Queue(maxsize=50)
                 per_request_tool_sem = asyncio.Semaphore(job.valves.MAX_PARALLEL_TOOLS_PER_REQUEST)
                 per_tool_timeout = job.valves.TOOL_TIMEOUT_SECONDS
                 batch_timeout = max(per_tool_timeout, job.valves.TOOL_BATCH_TIMEOUT_SECONDS)
@@ -2145,6 +2157,7 @@ class Pipe:
                         )
                     )
                 tool_token = self._TOOL_CONTEXT.set(tool_context)
+                outcome: dict[str, Any] = {}
                 result = await self._handle_pipe_call(
                     job.body,
                     job.user,
@@ -2159,10 +2172,12 @@ class Pipe:
                     session=session,
                     user_valves=job.user_valves,
                     rejected_user_valves=job.rejected_user_valves,
+                    outcome_sink=outcome,
                     )
                 if not job.future.done():
                     job.future.set_result(result)
-                self._circuit_breaker.reset(job.user_id)
+                if not job.task and outcome.get("error_occurred") is False:
+                    self._circuit_breaker.reset(job.user_id)
         except asyncio.CancelledError:
             if not job.future.done():
                 job.future.cancel()
@@ -2347,6 +2362,7 @@ class Pipe:
         rejected_user_valves: list[str] | None = None,
         valves: Pipe.Valves | None = None,
         session: aiohttp.ClientSession | None = None,
+        outcome_sink: dict[str, Any] | None = None,
     ) -> AsyncGenerator[str, None] | dict[str, Any] | str | None:
         """Process a user request and return either a stream or final text.
 
@@ -2562,6 +2578,7 @@ class Pipe:
                 virtual_variant_bases=virtual_variant_bases,
                 user_valves=user_valves,
                 rejected_user_valves=rejected_user_valves,
+                outcome_sink=outcome_sink,
             )
         except OpenRouterAPIError as e:
             shown = await self._ensure_error_formatter()._report_openrouter_error(
@@ -2695,6 +2712,7 @@ class Pipe:
         virtual_variant_bases: dict[str, str] | None = None,
         user_valves: Pipe.UserValves | None = None,
         rejected_user_valves: list[str] | None = None,
+        outcome_sink: dict[str, Any] | None = None,
     ) -> AsyncGenerator[str, None] | dict[str, Any] | str | None:
         return await self._ensure_request_orchestrator().process_request(
             body, __user__, __request__, __event_emitter__, __event_call__, __metadata__, __tools__,
@@ -2702,6 +2720,7 @@ class Pipe:
             allowlist_norm_ids, enforced_norm_ids, catalog_norm_ids, features,
             user_id=user_id, virtual_variant_bases=virtual_variant_bases,
             user_valves=user_valves, rejected_user_valves=rejected_user_valves,
+            outcome_sink=outcome_sink,
         )
 
     # Model Management
@@ -2911,79 +2930,103 @@ class Pipe:
         if not batch:
             return
         self.logger.debug("Batched %s tool(s) for %s", len(batch), batch[0].call.get("name"))
-        tasks = [self._invoke_tool_call(item, context) for item in batch]
-        gather_coro = asyncio.gather(*tasks, return_exceptions=True)
-        results: list[tuple[str, str, list[dict[str, Any]], list[str]] | BaseException] = []
+        ask_user_windows = [
+            self._ensure_tool_executor()._ask_user_window(item.tool_cfg, item.args) for item in batch
+        ]
+        batch_timeout = context.batch_timeout
+        open_windows = [window for window in ask_user_windows if window is not None]
+        if batch_timeout and open_windows:
+            batch_timeout = max(float(batch_timeout), *open_windows)
+        tasks = [asyncio.ensure_future(self._invoke_tool_call(item, context)) for item in batch]
         try:
-            if context.batch_timeout:
-                results = await asyncio.wait_for(gather_coro, timeout=context.batch_timeout)
-            else:
-                results = await gather_coro
+            async with asyncio.timeout(batch_timeout or None):
+                running = set(tasks)
+                while running:
+                    finished, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                    for item, task in zip(batch, tasks):
+                        if task in finished and not item.future.done():
+                            await self._hand_back_tool_result(item, context, *self._finished_tool_output(item, task))
         except TimeoutError:
+            pass
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            raise
+        pending = [task for task in tasks if not task.done()]
+        message = ""
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             message = (
-                f"Tool batch '{batch[0].call.get('name')}' exceeded {context.batch_timeout:.0f}s and was cancelled."
-                if context.batch_timeout
+                f"Tool batch '{batch[0].call.get('name')}' exceeded {batch_timeout:.0f}s and was cancelled."
+                if batch_timeout
                 else "Tool batch timed out."
             )
             context.timeout_error = context.timeout_error or message
             self.logger.warning("%s", message)
-            for item in batch:
-                tool_type = (item.tool_cfg.get("type") or "function").lower()
-                if not context.fusion_inner:
-                    self._circuit_breaker.record_tool_failure(
-                        context.user_id, tool_type, str(item.call.get("name") or "")
-                    )
-                if not item.future.done():
-                    item.future.set_result(
-                        self._ensure_tool_executor()._build_tool_output(
-                            item.call,
-                            message,
-                            status="failed",
-                        )
-                    )
-                    await self._dispatch_plugin_event(
-                        "dispatch_on_tool_result",
-                        str(item.call.get("name") or "?"),
-                        "failed",
-                        request_id=context.request_id,
-                        metadata=context.metadata or {},
-                    )
-            return
-        for item, result in zip(batch, results):
+        breaker = self._ensure_tool_executor()._tool_breaker(context)
+        for item, task, ask_user_window in zip(batch, tasks, ask_user_windows):
             if item.future.done():
                 continue
-            if isinstance(result, BaseException):
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    call_name = item.call.get("name")
-                    call_id = item.call.get("call_id")
-                    self.logger.debug(
-                        "Tool execution raised exception (name=%s, call_id=%s)",
-                        call_name,
-                        call_id,
-                        exc_info=(type(result), result, result.__traceback__),
+            if task in pending:
+                if item.holds_slot and breaker is not None and ask_user_window is None:
+                    breaker.record_tool_failure(
+                        context.user_id,
+                        (item.tool_cfg.get("type") or "function").lower(),
+                        str(item.call.get("name") or ""),
                     )
-                payload = self._ensure_tool_executor()._build_tool_output(
-                    item.call,
-                    f"Tool error: {result}",
-                    status="failed",
-                )
+                payload = self._ensure_tool_executor()._build_tool_output(item.call, message, status="failed")
                 resolved_status = "failed"
             else:
-                status, text, files, embeds = result
-                payload = self._ensure_tool_executor()._build_tool_output(item.call, text, status=status, files=files, embeds=embeds)
-                tool_type = (item.tool_cfg.get("type") or "function").lower()
-                self._circuit_breaker.reset_tool(
-                    context.user_id, tool_type, str(item.call.get("name") or "")
+                payload, resolved_status = self._finished_tool_output(item, task)
+            await self._hand_back_tool_result(item, context, payload, resolved_status)
+
+    @timed
+    def _finished_tool_output(
+        self,
+        item: _QueuedToolCall,
+        task: asyncio.Task[tuple[str, str, list[dict[str, Any]], list[str]]],
+    ) -> tuple[dict[str, Any], str]:
+        result: tuple[str, str, list[dict[str, Any]], list[str]] | BaseException = (
+            asyncio.CancelledError() if task.cancelled() else (task.exception() or task.result())
+        )
+        if isinstance(result, BaseException):
+            if self.logger.isEnabledFor(logging.DEBUG):
+                call_name = item.call.get("name")
+                call_id = item.call.get("call_id")
+                self.logger.debug(
+                    "Tool execution raised exception (name=%s, call_id=%s)",
+                    call_name,
+                    call_id,
+                    exc_info=(type(result), result, result.__traceback__),
                 )
-                resolved_status = str(status or "completed")
-            item.future.set_result(payload)
-            await self._dispatch_plugin_event(
-                "dispatch_on_tool_result",
-                str(item.call.get("name") or "?"),
-                resolved_status,
-                request_id=context.request_id,
-                metadata=context.metadata or {},
+            payload = self._ensure_tool_executor()._build_tool_output(
+                item.call,
+                self._ensure_tool_executor()._tool_error_text(result),
+                status="failed",
             )
+            return payload, "failed"
+        status, text, files, embeds = result
+        payload = self._ensure_tool_executor()._build_tool_output(item.call, text, status=status, files=files, embeds=embeds)
+        return payload, str(status or "completed")
+
+    @timed
+    async def _hand_back_tool_result(
+        self,
+        item: _QueuedToolCall,
+        context: _ToolExecutionContext,
+        payload: dict[str, Any],
+        status: str,
+    ) -> None:
+        item.future.set_result(payload)
+        await self._dispatch_plugin_event(
+            "dispatch_on_tool_result",
+            str(item.call.get("name") or "?"),
+            status,
+            request_id=context.request_id,
+            metadata=context.metadata or {},
+        )
 
     @timed
     async def _invoke_tool_call(
@@ -2994,7 +3037,32 @@ class Pipe:
         """Invoke a single tool call with circuit breaker protection."""
         tool_type = (item.tool_cfg.get("type") or "function").lower()
         gate_name = str(item.call.get("name") or "")
-        if not context.fusion_inner and not self._circuit_breaker.tool_allows(
+        if self._ensure_tool_executor()._ask_user_window(item.tool_cfg, item.args) is not None:
+            return await self._run_tool_unless_breaker_open(item, context, tool_type, gate_name)
+        async with context.per_request_semaphore:
+            if context.global_semaphore is not None:
+                async with self._acquire_tool_global(context.global_semaphore, item.call.get("name")):
+                    return await self._run_tool_unless_breaker_open(item, context, tool_type, gate_name)
+            return await self._run_tool_unless_breaker_open(item, context, tool_type, gate_name)
+
+    @timed
+    async def _run_tool_unless_breaker_open(
+        self,
+        item: _QueuedToolCall,
+        context: _ToolExecutionContext,
+        tool_type: str,
+        gate_name: str,
+    ) -> tuple[str, str, list[dict[str, Any]], list[str]]:
+        if item.future.done():
+            return (
+                "skipped",
+                f"Tool '{item.call.get('name')}' was not started: its result was no longer awaited.",
+                [],
+                [],
+            )
+        item.holds_slot = True
+        breaker = self._ensure_tool_executor()._tool_breaker(context)
+        if breaker is not None and not breaker.tool_allows(
             context.user_id, tool_type, gate_name
         ):
             await self._ensure_tool_executor()._notify_tool_breaker(context, tool_type, item.call.get("name"))
@@ -3004,12 +3072,7 @@ class Pipe:
                 [],
                 [],
             )
-
-        async with context.per_request_semaphore:
-            if context.global_semaphore is not None:
-                async with self._acquire_tool_global(context.global_semaphore, item.call.get("name")):
-                    return await self._run_tool_with_retries(item, context, tool_type, gate_name)
-            return await self._run_tool_with_retries(item, context, tool_type, gate_name)
+        return await self._run_tool_with_retries(item, context, tool_type, gate_name)
 
     @timed
     async def _run_tool_with_retries(
@@ -3041,17 +3104,19 @@ class Pipe:
         )
         timing_mark(f"tool_run:{tool_name}:start")
 
+        breaker = self._ensure_tool_executor()._tool_breaker(context)
         fn = item.tool_cfg.get("callable")
         if not callable(fn):
             message = f"Tool '{tool_name}' is missing a callable handler."
             self.logger.warning("%s", message)
-            if not context.fusion_inner:
-                self._circuit_breaker.record_tool_failure(
+            if breaker is not None:
+                breaker.record_tool_failure(
                     context.user_id, tool_type, breaker_key
                 )
             return ("failed", message, [], [])
         fn_to_call = cast(ToolCallable, fn)
-        timeout = float(context.timeout)
+        ask_user_window = self._ensure_tool_executor()._ask_user_window(item.tool_cfg, item.args)
+        timeout = ask_user_window if ask_user_window is not None else float(context.timeout)
 
         async def _process_and_emit(raw_result: Any) -> tuple[str, list[dict[str, Any]], list[str]]:
             timing_mark(f"tool_run:{tool_name}:processing")
@@ -3085,24 +3150,27 @@ class Pipe:
                 self.logger.debug("Result processing failed for '%s': %s", tool_name, proc_exc, exc_info=True)
                 return _fallback_tool_text(raw_result), [], []
 
+        deadline = asyncio.timeout(timeout)
         try:
             timing_mark(f"tool_run:{tool_name}:executing")
-            result = await asyncio.wait_for(
-                self._call_tool_callable(fn_to_call, item.args),
-                timeout=timeout,
-            )
-            self._circuit_breaker.reset_tool(context.user_id, tool_type, breaker_key)
+            async with deadline:
+                result = await self._call_tool_callable(fn_to_call, item.args)
+            if breaker is not None:
+                breaker.reset_tool(context.user_id, tool_type, breaker_key)
             text, files, embeds = await _process_and_emit(result)
             timing_mark(f"tool_run:{tool_name}:done")
             return ("completed", text, files, embeds)
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            timed_out = isinstance(exc, TimeoutError) and deadline.expired()
             mcp_disconnected = (
                 tool_type == "mcp"
                 and isinstance(exc, RuntimeError)
                 and "not connected" in str(exc)
             )
-            if not context.fusion_inner and not mcp_disconnected:
-                self._circuit_breaker.record_tool_failure(
+            if breaker is not None and not mcp_disconnected and not (timed_out and ask_user_window is not None):
+                breaker.record_tool_failure(
                     context.user_id, tool_type, breaker_key
                 )
             if self.logger.isEnabledFor(logging.DEBUG):
@@ -3119,7 +3187,9 @@ class Pipe:
                     [],
                     [],
                 )
-            return ("failed", f"Tool error: {exc}", [], [])
+            if timed_out:
+                return ("failed", f"Tool '{tool_name}' timed out after {timeout:.0f}s.", [], [])
+            return ("failed", self._ensure_tool_executor()._tool_error_text(exc), [], [])
 
     @timed
     async def _call_tool_callable(self, fn: ToolCallable, args: dict[str, Any]) -> Any:

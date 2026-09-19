@@ -8,6 +8,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from ..api.gateway.responses_adapter import _record_failed_call
 from ..core.config import _PIPE_METADATA_KEY, _select_openrouter_http_referer
 from ..core.costs import maybe_dump_costs_snapshot
 from ..core.errors import OpenRouterAPIError
@@ -1027,10 +1028,12 @@ class ImageGenerationAdapter:
         user_obj: Any,
         normalized_model_id: str,
         api_model_id: str,
+        outcome_sink: dict[str, Any] | None = None,
+        breaker_key: str | None = None,
     ) -> str:
-        outcome: _Outcome = {"usage": None, "reported": False, "costed": False}
+        outcome: _Outcome = {"usage": None, "reported": False, "costed": False, "sent": False, "delivered": False}
         try:
-            return await self._generate(
+            content = await self._generate(
                 body=body,
                 user=user,
                 responses_body=responses_body,
@@ -1052,7 +1055,7 @@ class ImageGenerationAdapter:
         except OpenRouterAPIError as exc:
             await self._close_status(event_emitter)
             await self._settle(outcome, valves, user, metadata, user_obj, api_model_id)
-            return await self._pipe._ensure_error_formatter()._report_openrouter_error(
+            content = await self._pipe._ensure_error_formatter()._report_openrouter_error(
                 exc,
                 event_emitter=event_emitter,
                 normalized_model_id=normalized_model_id,
@@ -1063,16 +1066,26 @@ class ImageGenerationAdapter:
             await self._close_status(event_emitter)
             outcome["usage"] = outcome["usage"] or getattr(exc, "usage", None) or None
             await self._settle(outcome, valves, user, metadata, user_obj, api_model_id)
-            return await self._emit_failure(
+            content = await self._emit_failure(
                 event_emitter, str(exc).strip() or type(exc).__name__
             )
         except Exception as exc:
             self._logger.exception("Image generation failed for %r", api_model_id)
             await self._close_status(event_emitter)
             await self._settle(outcome, valves, user, metadata, user_obj, api_model_id)
-            return await self._emit_failure(
+            content = await self._emit_failure(
                 event_emitter, str(exc).strip() or type(exc).__name__
             )
+        self._settle_request(outcome, outcome_sink, breaker_key)
+        return content
+
+    def _settle_request(
+        self, outcome: _Outcome, outcome_sink: dict[str, Any] | None, breaker_key: str | None
+    ) -> None:
+        if outcome_sink is not None:
+            outcome_sink["error_occurred"] = not outcome["delivered"]
+        if outcome["sent"] and not outcome["delivered"]:
+            _record_failed_call(self._pipe, breaker_key)
 
     async def _settle(
         self,
@@ -1222,6 +1235,7 @@ class ImageGenerationAdapter:
             )
 
         started_at = time.monotonic()
+        outcome["sent"] = True
         result: ImageGenerationResult = await self._client(
             session, valves, user=user_obj, owui_chat_id=chat_id
         ).generate(
@@ -1285,6 +1299,7 @@ class ImageGenerationAdapter:
             )
 
         content = "\n\n".join(snippets)
+        outcome["delivered"] = True
         outcome["reported"] = True
         await self._report_generation(result.usage, "ok", metadata)
         if event_emitter:

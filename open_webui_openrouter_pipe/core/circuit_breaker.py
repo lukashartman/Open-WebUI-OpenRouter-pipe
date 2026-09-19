@@ -17,6 +17,12 @@ from collections import defaultdict, deque
 from typing import ClassVar
 
 
+def live_tool_failures(failures: deque[float], now: float, window_seconds: float) -> int:
+    if failures and now - failures[-1] > window_seconds:
+        return 0
+    return len(failures)
+
+
 class CircuitBreaker:
     """Circuit breaker for request and tool failure tracking.
 
@@ -65,10 +71,10 @@ class CircuitBreaker:
 
         tool_breakers: dict[str, dict[tuple[str, str], deque[float]]] = {}
         for user_id, tool_windows in self._tool_breakers.items():
-            tool_breakers[user_id] = {
-                tool_key: deque(window, maxlen=new_threshold)
-                for tool_key, window in tool_windows.items()
-            }
+            tool_breakers[user_id] = defaultdict(
+                lambda: deque(maxlen=new_threshold),
+                {tool_key: deque(window, maxlen=new_threshold) for tool_key, window in tool_windows.items()},
+            )
         self._tool_breakers = defaultdict(
             lambda: defaultdict(lambda: deque(maxlen=new_threshold)),
             tool_breakers,
@@ -138,10 +144,6 @@ class CircuitBreaker:
     def tool_allows(self, user_id: str, tool_type: str, tool_name: str = "") -> bool:
         """Check if a specific tool type is allowed for a user.
 
-        Similar to allows() but tracks failures per tool type.
-        Returns False if too many failures of this tool type have occurred
-        within the time window.
-
         Args:
             user_id: User identifier
             tool_type: Tool type identifier
@@ -153,13 +155,10 @@ class CircuitBreaker:
             return True
 
         window = self._tool_breakers[user_id][(tool_type, tool_name)]
-        now = time.time()
-
-        # Evict old failures outside the window
-        while window and now - window[0] > self._window_seconds:
-            window.popleft()
-
-        return len(window) < self._threshold
+        live = live_tool_failures(window, time.time(), self._window_seconds)
+        if not live:
+            window.clear()
+        return live < self._threshold
 
     def record_tool_failure(self, user_id: str, tool_type: str, tool_name: str = "") -> None:
         """Record a tool execution failure for a specific tool type.

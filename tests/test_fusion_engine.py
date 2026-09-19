@@ -1019,3 +1019,112 @@ class TestMemberFileCaptureRobustness:
         assert result.failed is False
         assert "data:image" not in result.content
         assert "![tool image](/api/v1/files/abc/content)" in result.content
+
+
+_OPEN_WEBUI_ASK_USER = "Open WebUI's ask_user"
+
+
+def _is_first_request(request_body: dict) -> bool:
+    return not any(
+        isinstance(item, dict) and item.get("type") == "function_call_output" for item in request_body.get("input") or []
+    )
+
+
+def _panel_model_that_asks_the_user(captured: list[dict]):
+    """A model that first calls whichever tool is offered as Open WebUI's ask_user (or a tool named ask_user when none
+    is), then answers."""
+
+    async def fake_stream(self, session, request_body, **_kwargs):
+        captured.append(dict(request_body))
+        if not _is_first_request(request_body):
+            yield {"type": "response.output_text.delta", "delta": "member answer"}
+            yield {"type": "response.completed", "response": {"output": [], "usage": {}}}
+            return
+        offered = [
+            tool.get("name") for tool in request_body.get("tools") or [] if tool.get("description") == _OPEN_WEBUI_ASK_USER
+        ]
+        call = {"type": "function_call", "call_id": f"call-{len(captured)}", "name": offered[0] if offered else "ask_user",
+                "arguments": "{}", "status": "completed"}
+        yield {"type": "response.output_item.done", "item": call}
+        yield {"type": "response.completed", "response": {"output": [call], "usage": {}}}
+
+    return fake_stream
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("renamed", "outer_names_in_metadata"),
+    [(False, True), (True, True), (True, False)],
+    ids=["keyed-as-open-webui-keys-it", "renamed-for-a-name-collision", "merged-back-from-open-webui-metadata"],
+)
+async def test_no_model_in_a_fusion_turn_is_offered_or_runs_open_webuis_ask_user(
+    orchestrator_and_pipe, monkeypatch, renamed, outer_names_in_metadata
+):
+    # Panel models run at the same time and the browser shows one ask_user dialog at a time, so no model inside a
+    # Fusion turn is offered ask_user (the user's decision, 2026-09-15). Every other tool stays.
+    from open_webui_openrouter_pipe import _ToolExecutionContext
+    from open_webui_openrouter_pipe.models.registry import ModelFamily
+    from open_webui_openrouter_pipe.tools.tool_registry import _build_collision_safe_tool_specs_and_registry
+
+    orchestrator, pipe = orchestrator_and_pipe
+    _prepare_pipe(pipe)
+    monkeypatch.setattr(ModelFamily, "supports", classmethod(lambda cls, cap, m: cap == "function_calling"))
+    captured: list[dict] = []
+    monkeypatch.setattr(Pipe, "send_openrouter_streaming_request", _panel_model_that_asks_the_user(captured))
+
+    asked: list[str] = []
+
+    async def ask_user(**_kwargs):
+        asked.append("asked")
+        await asyncio.sleep(0.05)
+        return json.dumps({"status": "answered", "answers": {}})
+
+    async def lookup(**_kwargs):
+        return "found"
+
+    no_parameters = {"type": "object", "properties": {}}
+    open_webui_tools = {
+        "ask_user": {"tool_id": "builtin:ask_user", "type": "builtin", "callable": ask_user,
+                     "spec": {"name": "ask_user", "description": _OPEN_WEBUI_ASK_USER, "parameters": no_parameters}},
+        "lookup": {"tool_id": "local_lookup", "callable": lookup,
+                   "spec": {"name": "lookup", "description": "Look it up", "parameters": no_parameters}},
+    }
+    direct = {"ask_user": {"direct": True, "callable": lookup,
+                           "spec": {"name": "ask_user", "description": "A tool server's own ask_user",
+                                    "parameters": no_parameters}}} if renamed else None
+    _, outer_registry, outer_names = _build_collision_safe_tool_specs_and_registry(
+        request_tool_specs=None, owui_registry=open_webui_tools, direct_registry=direct, builtin_registry=None,
+        extra_tools=None, strictify=False, owui_tool_passthrough=False, logger=None,
+    )
+    assert ("ask_user" in outer_registry) is not renamed, sorted(outer_registry)
+
+    invocation = _invocation(orchestrator, pipe, Valves())
+    invocation.tools = outer_registry
+    invocation.metadata = {"chat_id": "outer-chat", "message_id": "outer-msg", "tools": open_webui_tools}
+    if outer_names_in_metadata:
+        invocation.metadata["_pipe_exposed_to_origin"] = outer_names
+    outer_context = _ToolExecutionContext(
+        queue=asyncio.Queue(maxsize=50), per_request_semaphore=asyncio.Semaphore(5), global_semaphore=None,
+        timeout=30.0, batch_timeout=60.0, idle_timeout=None, user_id="u1", event_emitter=None, batch_cap=4,
+    )
+    token = pipe._TOOL_CONTEXT.set(outer_context)
+    try:
+        results = await asyncio.gather(*(
+            run_fusion_member(
+                pipe, invocation, model=model, messages=invocation.messages, system_prompt="PANEL PROMPT",
+                max_tool_calls=4, live_queue=None, bypass_restrictions=True, server_tools_config=({}, []),
+            )
+            for model in ("openai/gpt-5", "openai/gpt-5-mini")
+        ))
+    finally:
+        pipe._TOOL_CONTEXT.reset(token)
+
+    assert [result.failed for result in results] == [False, False]
+    assert asked == []
+    first_requests = [body for body in captured if _is_first_request(body)]
+    assert len(first_requests) == 2
+    for body in first_requests:
+        offered = [tool.get("description") for tool in body.get("tools") or [] if tool.get("type") == "function"]
+        assert _OPEN_WEBUI_ASK_USER not in offered, offered
+        assert "Look it up" in offered, offered
+        assert ("A tool server's own ask_user" in offered) is renamed, offered

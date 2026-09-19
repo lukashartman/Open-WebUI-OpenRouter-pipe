@@ -3433,6 +3433,7 @@ class TestToolExecution:
             item.call = {"name": "boomtool", "call_id": "call_1"}
             item.tool_cfg = {"type": "function", "callable": boom}
             item.args = {}
+            item.future = asyncio.get_running_loop().create_future()
             context = Mock(spec=_ToolExecutionContext)
             context.user_id = "test_user_single_shot"
             context.fusion_inner = False
@@ -3461,6 +3462,7 @@ class TestToolExecution:
             item.call = {"name": "srv_lookup", "call_id": "call_1"}
             item.tool_cfg = {"type": "mcp", "callable": gone}
             item.args = {}
+            item.future = asyncio.get_running_loop().create_future()
             context = Mock(spec=_ToolExecutionContext)
             context.user_id = "test_user_mcp_gone"
             context.fusion_inner = False
@@ -3496,6 +3498,7 @@ class TestToolExecution:
                 item.call = {"call_id": "call_1"}
                 item.tool_cfg = {"type": "function", "callable": boom}
                 item.args = {}
+                item.future = asyncio.get_running_loop().create_future()
                 return item
 
             context = Mock(spec=_ToolExecutionContext)
@@ -3531,6 +3534,7 @@ class TestToolExecution:
             item.call = {"name": "db_query", "call_id": "call_1"}
             item.tool_cfg = {"type": "function", "callable": down}
             item.args = {}
+            item.future = asyncio.get_running_loop().create_future()
             context = Mock(spec=_ToolExecutionContext)
             context.user_id = "test_user_db_down"
             context.fusion_inner = False
@@ -3565,6 +3569,7 @@ class TestToolExecution:
             item.call = {"name": "srv_thing", "call_id": "call_1"}
             item.tool_cfg = {"type": "mcp", "callable": broken}
             item.args = {}
+            item.future = asyncio.get_running_loop().create_future()
             context = Mock(spec=_ToolExecutionContext)
             context.user_id = "test_user_mcp_raise"
             context.fusion_inner = False
@@ -3601,6 +3606,7 @@ class TestToolExecution:
             item.call = {"name": "srv_tool", "call_id": "c1"}
             item.tool_cfg = {"type": "mcp", "callable": mcp_tool}
             item.args = {}
+            item.future = asyncio.get_running_loop().create_future()
             context = Mock(spec=_ToolExecutionContext)
             context.user_id = "u-fallback"
             context.fusion_inner = False
@@ -3640,6 +3646,7 @@ class TestToolExecution:
             item.call = {"name": "srv_obj", "call_id": "c1"}
             item.tool_cfg = {"type": "mcp", "callable": mcp_tool}
             item.args = {}
+            item.future = asyncio.get_running_loop().create_future()
             context = Mock(spec=_ToolExecutionContext)
             context.user_id = "u-fallback-obj"
             context.fusion_inner = False
@@ -8766,7 +8773,7 @@ class TestToolWorkerIntegration:
             )
 
             # Put item in queue
-            await context.queue.put(item)
+            await context.queue.put([item])
             # Put None to signal end
             await context.queue.put(None)
 
@@ -8779,8 +8786,8 @@ class TestToolWorkerIntegration:
             await pipe.close()
 
     @pytest.mark.asyncio
-    async def test_tool_worker_loop_handles_timeout(self):
-        """Test that _tool_worker_loop handles idle timeout."""
+    async def test_tool_worker_loop_keeps_waiting_past_the_idle_limit(self):
+        """A set idle limit does not end the worker; the end-of-request sentinel does."""
         pipe = Pipe()
 
         try:
@@ -8792,17 +8799,20 @@ class TestToolWorkerIntegration:
                 global_semaphore=None,
                 timeout=30.0,
                 batch_timeout=5.0,
-                idle_timeout=0.1,  # Very short timeout
+                idle_timeout=0.1,
                 user_id="test_user",
                 event_emitter=None,
                 batch_cap=10,
             )
 
-            # Run worker loop - should timeout quickly
-            await pipe._ensure_tool_executor()._tool_worker_loop(context)
+            worker = asyncio.create_task(pipe._ensure_tool_executor()._tool_worker_loop(context))
+            await asyncio.sleep(0.3)
+            still_waiting = not worker.done()
+            await context.queue.put(None)
+            await asyncio.wait_for(worker, timeout=1.0)
 
-            # Should have set timeout error
-            assert context.timeout_error is not None
+            assert still_waiting
+            assert context.timeout_error is None
         finally:
             await pipe.close()
 

@@ -24,10 +24,12 @@ def _calls(n: int) -> list[dict]:
 
 
 class _CtxHarness:
-    def __init__(self, pipe, *, fusion_inner=False, tool_call_budget=None):
+    def __init__(self, pipe, *, fusion_inner=False, tool_call_budget=None, tool_breaker=None, batch_timeout=5.0):
         self.pipe = pipe
         self.fusion_inner = fusion_inner
         self.tool_call_budget = tool_call_budget
+        self.tool_breaker = tool_breaker
+        self.batch_timeout = batch_timeout
         self.ctx: Any = None
         self.token: Any = None
 
@@ -37,12 +39,13 @@ class _CtxHarness:
             per_request_semaphore=asyncio.Semaphore(2),
             global_semaphore=None,
             timeout=5.0,
-            batch_timeout=5.0,
+            batch_timeout=self.batch_timeout,
             idle_timeout=None,
             user_id="u1",
             event_emitter=None,
             batch_cap=1,
             fusion_inner=self.fusion_inner,
+            tool_breaker=self.tool_breaker,
             tool_call_budget=self.tool_call_budget,
         )
         executor = self.pipe._ensure_tool_executor()
@@ -131,3 +134,53 @@ class TestInnerToolBudget:
                 _calls(3), _registry(_echo_tool)
             )
         assert sum("echo-ok" in str(o) for o in outputs) == 3
+
+
+class TestInnerSuccessLeavesTheUsersFailures:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("threshold", [2, 3])
+    async def test_a_fusion_members_successful_call_leaves_the_users_own_tool_failures_alone(
+        self, pipe_instance_async, threshold
+    ):
+        pipe = pipe_instance_async
+        pipe._circuit_breaker.threshold = threshold
+        for _ in range(threshold - 1):
+            pipe._circuit_breaker.record_tool_failure("u1", "function", "mytool")
+        async with _CtxHarness(pipe, fusion_inner=True):
+            outputs = await pipe._ensure_tool_executor()._execute_function_calls(_calls(1), _registry(_echo_tool))
+        assert "echo-ok" in str(outputs[0])
+
+        # The user's own failures are still on record: one more trips the tool for the user.
+        pipe._circuit_breaker.record_tool_failure("u1", "function", "mytool")
+        assert pipe._circuit_breaker.tool_allows("u1", "function", "mytool") is False
+
+
+async def _never_returns(**kwargs: Any) -> str:
+    await asyncio.sleep(3600)
+    return "never"
+
+
+class TestInnerBatchLimitCountsForTheTurn:
+    @pytest.mark.asyncio
+    async def test_a_fusion_members_call_cut_by_the_batch_limit_counts_for_the_turn_not_the_user(self, pipe_instance_async):
+        from open_webui_openrouter_pipe.core.circuit_breaker import CircuitBreaker
+
+        pipe = pipe_instance_async
+        pipe._circuit_breaker.threshold = 1
+        turn_breaker = CircuitBreaker(threshold=1, window_seconds=60)
+        async with _CtxHarness(pipe, fusion_inner=True, tool_breaker=turn_breaker, batch_timeout=0.05):
+            outputs = await pipe._ensure_tool_executor()._execute_function_calls(_calls(1), _registry(_never_returns))
+
+        assert "exceeded" in str(outputs[0])
+        assert turn_breaker.tool_allows("u1", "function", "mytool") is False
+        assert pipe._circuit_breaker.tool_allows("u1", "function", "mytool") is True
+
+    @pytest.mark.asyncio
+    async def test_a_users_own_call_cut_by_the_batch_limit_counts_for_the_user(self, pipe_instance_async):
+        pipe = pipe_instance_async
+        pipe._circuit_breaker.threshold = 1
+        async with _CtxHarness(pipe, fusion_inner=False, batch_timeout=0.05):
+            outputs = await pipe._ensure_tool_executor()._execute_function_calls(_calls(1), _registry(_never_returns))
+
+        assert "exceeded" in str(outputs[0])
+        assert pipe._circuit_breaker.tool_allows("u1", "function", "mytool") is False

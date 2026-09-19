@@ -1258,3 +1258,45 @@ def test_an_unreadable_data_volume_is_reported_once_and_names_the_path(caplog, m
     assert disk[0].exc_info is not None
     assert not any("failed to import" in r.getMessage() for r in caplog.records)
     assert "disk_free" not in out
+
+
+class TestToolBreakerCountsFollowTheBreaker:
+    """The Health tab's tool-breaker counts must agree with the breaker that skips the tool."""
+
+    @staticmethod
+    def _breaker_with_failures(monkeypatch, clock, threshold, gaps):
+        from open_webui_openrouter_pipe.core.circuit_breaker import CircuitBreaker
+
+        monkeypatch.setattr(time, "time", lambda: clock[0])
+        breaker = CircuitBreaker(threshold=threshold, window_seconds=60.0)
+        breaker.record_tool_failure("user1", "function", "lookup")
+        for gap in gaps:
+            clock[0] += gap
+            breaker.record_tool_failure("user1", "function", "lookup")
+        return breaker
+
+    @pytest.mark.parametrize(("threshold", "gaps"), [(2, (90.0,)), (3, (70.0, 70.0))])
+    def test_failures_in_a_row_count_as_tripped_while_the_breaker_skips_the_tool(self, monkeypatch, threshold, gaps):
+        clock = [1_000.0]
+        breaker = self._breaker_with_failures(monkeypatch, clock, threshold, gaps)
+        clock[0] += 10.0
+        pipe = _make_mock_pipe()
+        pipe._circuit_breaker = breaker
+
+        rl = collect_fast_stats(pipe)["rate_limits"]
+
+        assert breaker.tool_allows("user1", "function", "lookup") is False
+        assert (rl["tool_tripped"], rl["tool_with_failures"]) == (1, 1)
+
+    @pytest.mark.parametrize(("threshold", "gaps"), [(2, (90.0,)), (3, (70.0, 70.0))])
+    def test_a_tool_quiet_for_a_whole_window_counts_as_neither(self, monkeypatch, threshold, gaps):
+        clock = [1_000.0]
+        breaker = self._breaker_with_failures(monkeypatch, clock, threshold, gaps)
+        clock[0] += 61.0
+        pipe = _make_mock_pipe()
+        pipe._circuit_breaker = breaker
+
+        rl = collect_fast_stats(pipe)["rate_limits"]
+
+        assert breaker.tool_allows("user1", "function", "lookup") is True
+        assert (rl["tool_tripped"], rl["tool_with_failures"]) == (0, 0)

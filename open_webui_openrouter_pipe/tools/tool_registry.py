@@ -11,7 +11,9 @@ Ensures collision-safe tool names and builds execution registry for dispatcher.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from ..core.timing_logger import timed
@@ -177,6 +179,47 @@ def _tool_prefix_for_collision(source: str, tool_cfg: dict[str, Any] | None) -> 
     return "tool__"
 
 
+_PROVIDER_TOOL_NAME_MAX = 64
+_NOT_IN_PROVIDER_TOOL_NAME = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _provider_tool_name(wanted: str, digest: str, used_names: set[str]) -> str:
+    safe = _NOT_IN_PROVIDER_TOOL_NAME.sub("_", wanted)
+    if safe == wanted and len(wanted) <= _PROVIDER_TOOL_NAME_MAX and wanted not in used_names:
+        return wanted
+    base = f"{safe[: _PROVIDER_TOOL_NAME_MAX - len(digest) - 2]}__{digest}"
+    if base not in used_names:
+        return base
+    for ordinal in itertools.count(2):
+        suffix = f"_{ordinal}"
+        candidate = f"{base[: _PROVIDER_TOOL_NAME_MAX - len(suffix)]}{suffix}"
+        if candidate not in used_names:
+            return candidate
+    raise AssertionError("unreachable")
+
+
+def _advertised_names_for_replayed_calls(items: Any, exposed_to_origin: dict[str, str] | None) -> None:
+    if not isinstance(items, list):
+        return
+    advertised = exposed_to_origin or {}
+    exposed_by_origin: dict[str, str] = {}
+    shared_origins: set[str] = set()
+    for exposed, origin in advertised.items():
+        if exposed_by_origin.setdefault(origin, exposed) != exposed:
+            shared_origins.add(origin)
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name or name in advertised:
+            continue
+        if name in exposed_by_origin and name not in shared_origins:
+            item["name"] = exposed_by_origin[name]
+        else:
+            digest = hashlib.sha1(f"replayed::{name}".encode()).hexdigest()[:8]
+            item["name"] = _provider_tool_name(name, digest, set())
+
+
 
 @timed
 def _build_collision_safe_tool_specs_and_registry(
@@ -205,8 +248,8 @@ def _build_collision_safe_tool_specs_and_registry(
     builtin_registry = builtin_registry or {}
 
     # Normalize all registries into lists so we can preserve collisions.
-    owui_entries: list[dict[str, Any]] = [
-        entry for entry in owui_registry.values() if isinstance(entry, dict)
+    owui_entries: list[tuple[str, dict[str, Any]]] = [
+        (key, entry) for key, entry in owui_registry.items() if isinstance(entry, dict)
     ]
     direct_entries: list[dict[str, Any]] = [
         entry for entry in direct_registry.values() if isinstance(entry, dict)
@@ -222,7 +265,7 @@ def _build_collision_safe_tool_specs_and_registry(
                 if isinstance(spec, dict) and spec.get("name") == name:
                     return e
         if prefer == "owui":
-            for e in owui_entries:
+            for _, e in owui_entries:
                 spec = e.get("spec")
                 if isinstance(spec, dict) and spec.get("name") == name:
                     return e
@@ -236,7 +279,7 @@ def _build_collision_safe_tool_specs_and_registry(
             spec = e.get("spec")
             if isinstance(spec, dict) and spec.get("name") == name:
                 return e
-        for e in owui_entries:
+        for _, e in owui_entries:
             spec = e.get("spec")
             if isinstance(spec, dict) and spec.get("name") == name:
                 return e
@@ -246,14 +289,8 @@ def _build_collision_safe_tool_specs_and_registry(
                 return e
         return None
 
-    request_names: set[str] = set()
-    for tool in request_tool_specs:
-        if isinstance(tool, dict) and tool.get("type") == "function":
-            name = tool.get("name")
-            if isinstance(name, str) and name.strip():
-                request_names.add(name.strip())
-
     candidates: list[dict[str, Any]] = []
+    resolved_request_names: set[str] = set()
 
     # 1) Request-provided tool specs (OWUI-native `tools`).
     for raw_tool in request_tool_specs:
@@ -261,10 +298,19 @@ def _build_collision_safe_tool_specs_and_registry(
         if not spec:
             continue
         origin_name = spec["name"]
+        same_name_entries = sum(
+            1
+            for _, entry in owui_entries
+            if isinstance(entry.get("spec"), dict) and entry["spec"].get("name") == origin_name
+        )
+        if same_name_entries > 1:
+            log.debug("Skipping request tool %s: %d registry tools share the name.", origin_name, same_name_entries)
+            continue
         tool_cfg = _pick_executor(origin_name)
         if (not owui_tool_passthrough) and (not tool_cfg or tool_cfg.get("callable") is None):
             log.debug("Skipping unexecutable request tool %s (no callable).", origin_name)
             continue
+        resolved_request_names.add(origin_name)
         candidates.append(
             {
                 "origin_source": "owui_request_tools",
@@ -293,14 +339,18 @@ def _build_collision_safe_tool_specs_and_registry(
             }
         )
 
-    # 3) Registry tools (__tools__), excluding those already present in request tools (to avoid duplication).
-    for tool_cfg in owui_entries:
+    for key, tool_cfg in owui_entries:
         spec = _responses_spec_from_owui_tool_cfg(tool_cfg, strictify=strictify)
         if not spec:
             continue
-        origin_name = spec["name"]
-        if origin_name in request_names:
+        if spec["name"] in resolved_request_names:
             continue
+        carried_origin = tool_cfg.get("origin_name") if tool_cfg.get("origin_source") else None
+        if isinstance(carried_origin, str) and carried_origin.strip():
+            origin_name = carried_origin.strip()
+        else:
+            origin_name = key.strip() if isinstance(key, str) and key.strip() else spec["name"]
+        spec["name"] = origin_name
         if (not owui_tool_passthrough) and tool_cfg.get("callable") is None:
             continue
         candidates.append(
@@ -349,12 +399,12 @@ def _build_collision_safe_tool_specs_and_registry(
         needs_rename = len(group) > 1
 
         prefix = _tool_prefix_for_collision(c["origin_source"], c.get("tool_cfg"))
-        exposed_name = origin_name if not needs_rename else f"{prefix}{origin_name}"
-        if exposed_name in used_names:
-            digest = hashlib.sha1(
-                f"{c['origin_source']}::{c.get('origin_key')}::{origin_name}".encode()
-            ).hexdigest()[:8]
-            exposed_name = f"{exposed_name}__{digest}"
+        digest = hashlib.sha1(
+            f"{c['origin_source']}::{c.get('origin_key')}::{origin_name}".encode()
+        ).hexdigest()[:8]
+        exposed_name = _provider_tool_name(
+            origin_name if not needs_rename else f"{prefix}{origin_name}", digest, used_names
+        )
         used_names.add(exposed_name)
 
         spec = dict(c["spec"])

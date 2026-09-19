@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -11,6 +12,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
+from ..core.circuit_breaker import CircuitBreaker
 from ..core.config import _PIPE_METADATA_KEY, NO_CONTENT_AFTER_TOOLS_FALLBACK
 from ..core.errors import OpenRouterAPIError
 from ..core.fusion_defaults import (
@@ -139,6 +141,8 @@ class FusionInnerInvocation:
     # could leave one panel member routing with ZDR and another without it, in one turn.
     user_valves: Any = None
     rejected_user_valves: list = field(default_factory=list)
+    no_usable_member: bool = False
+    tool_breaker: Any = None
 
 
 async def run_fusion_member(
@@ -207,10 +211,11 @@ async def run_fusion_member(
             metadata=inner_metadata,
             request_id=SessionLogger.request_id.get() or "",
             fusion_inner=True,
+            tool_breaker=invocation.tool_breaker,
             tool_call_budget=max_tool_calls,
         )
         executor = pipe._ensure_tool_executor()
-        for _ in range(2):
+        for _ in range(invocation.valves.MAX_PARALLEL_TOOLS_PER_REQUEST):
             ctx.workers.append(asyncio.create_task(executor._tool_worker_loop(ctx)))
         token = pipe._TOOL_CONTEXT.set(ctx)
     collector = FusionCollector(model, live_queue)
@@ -467,6 +472,9 @@ async def run_internal_fusion(
     plan: FusionRunPlan,
 ) -> AsyncGenerator[dict[str, Any], None]:
     valves = invocation.valves
+    invocation.tool_breaker = CircuitBreaker(
+        threshold=valves.BREAKER_MAX_FAILURES, window_seconds=math.inf
+    )
     panel_prompt = resolve_fusion_prompt(
         getattr(valves, "FUSION_PANEL_SYSTEM_PROMPT", ""), DEFAULT_FUSION_PANEL_SYSTEM_PROMPT
     )
@@ -551,6 +559,7 @@ async def run_internal_fusion(
 
         ordered = [results[m] for m in dict.fromkeys(plan.panel_models) if m in results]
         usable = [r for r in ordered if not r.failed]
+        invocation.no_usable_member = not usable
         analysis: dict[str, Any] | None = None
         question = latest_user_text(invocation.messages)
 

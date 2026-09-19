@@ -968,9 +968,9 @@ class TestOutcomeSink:
         assert "mid-stream death" in (sink.get("reason") or "")
 
 
-class TestInnerBreakerSuppression:
+class TestInnerCallsCountForTheChattingUser:
 
-    async def _capture_send_kwargs(self, pipe, monkeypatch, metadata):
+    async def _capture_send_kwargs(self, pipe, monkeypatch, metadata, user_id="u"):
         captured: dict[str, Any] = {}
 
         async def fake_stream(self, session, request_body, **kwargs):
@@ -982,7 +982,7 @@ class TestInnerBreakerSuppression:
         body = ResponsesBody(model="openai/gpt-5", input=[], stream=True)
         await pipe._streaming_handler._run_streaming_loop(
             body, pipe.valves, None, metadata=metadata, tools={},
-            session=cast(Any, object()), user_id="u",
+            session=cast(Any, object()), user_id=user_id,
         )
         return captured
 
@@ -992,12 +992,15 @@ class TestInnerBreakerSuppression:
         assert captured.get("breaker_key") == "u"
 
     @pytest.mark.asyncio
-    async def test_inner_marker_suppresses_breaker_key(self, monkeypatch, pipe_instance_async):
+    @pytest.mark.parametrize("user_id", ["u", "user-2"])
+    async def test_an_inner_fusion_call_counts_its_failures_for_the_chatting_user(
+        self, monkeypatch, pipe_instance_async, user_id
+    ):
         from open_webui_openrouter_pipe.core.config import _PIPE_METADATA_KEY
 
         metadata = {_PIPE_METADATA_KEY: {"fusion_inner": True}}
-        captured = await self._capture_send_kwargs(pipe_instance_async, monkeypatch, metadata)
-        assert captured.get("breaker_key") is None
+        captured = await self._capture_send_kwargs(pipe_instance_async, monkeypatch, metadata, user_id)
+        assert captured.get("breaker_key") == user_id
 
 
 class TestInnerReasoningForward:

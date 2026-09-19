@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
+from ..api.gateway.responses_adapter import _record_failed_call
 from ..core.config import _PIPE_METADATA_KEY, _select_openrouter_http_referer
 from ..core.costs import maybe_dump_costs_snapshot
 from ..core.errors import OpenRouterAPIError, RequiredInternalFileError
@@ -387,6 +388,8 @@ class VideoGenerationAdapter:
         user_obj: Any,
         normalized_model_id: str,
         api_model_id: str,
+        outcome_sink: dict[str, Any] | None = None,
+        breaker_key: str | None = None,
     ) -> str:
         prompt = self._extract_prompt(body)
         video_spec = OpenRouterModelRegistry.spec(normalized_model_id)
@@ -416,13 +419,14 @@ class VideoGenerationAdapter:
         user_id = _clean_str(user.get("id")) or _clean_str(metadata.get("user_id")) or "anonymous"
         existing = await self._get_active_task(key)
         if existing is not None:
-            return await self._await_existing_task(existing, event_emitter)
+            return await self._await_existing_task(existing, event_emitter, outcome_sink)
 
         message_lock = await self._acquire_message_lock(key)
         global_semaphore: asyncio.Semaphore | None = None
         global_slot_acquired = False
         user_slot_acquired = False
         lifecycle_transferred = False
+        submitted = False
         job_id = ""
         disclosure_block = ""
 
@@ -431,7 +435,7 @@ class VideoGenerationAdapter:
             if existing is not None:
                 await self._release_message_lock(key, message_lock)
                 message_lock = None  # type: ignore[assignment]
-                return await self._await_existing_task(existing, event_emitter)
+                return await self._await_existing_task(existing, event_emitter, outcome_sink)
 
             persisted = await self._persistence.load_message_content(chat_id=chat_id, message_id=message_id)
             if self._looks_like_final_video_content(persisted):
@@ -482,11 +486,13 @@ class VideoGenerationAdapter:
                     message_lock=message_lock,
                     started_at=time.monotonic(),
                     disclosure_block=resumed_disclosure,
+                    breaker_key=breaker_key,
                 )
                 lifecycle_transferred = True
                 async with self._pipe._video_active_tasks_dict_lock:
                     self._pipe._video_active_tasks[key] = bg_task
                 result = await asyncio.shield(bg_task)
+                self._settle_request(result, outcome_sink)
                 await self._emit_completion(event_emitter, result.content, usage=result.usage)
                 return result.content
 
@@ -721,6 +727,7 @@ class VideoGenerationAdapter:
                 user=user_obj,
                 owui_chat_id=chat_id,
             )
+            submitted = True
             accepted = await client.submit(payload)
             job_id = self._extract_job_id(accepted)
             if not job_id:
@@ -759,17 +766,20 @@ class VideoGenerationAdapter:
                 message_lock=message_lock,
                 started_at=time.monotonic(),
                 disclosure_block=disclosure_block,
+                breaker_key=breaker_key,
             )
             lifecycle_transferred = True
             async with self._pipe._video_active_tasks_dict_lock:
                 self._pipe._video_active_tasks[key] = bg_task
 
             result = await asyncio.shield(bg_task)
+            self._settle_request(result, outcome_sink)
             await self._emit_completion(event_emitter, result.content, usage=result.usage)
             return result.content
         except asyncio.CancelledError:
             raise
         except OpenRouterAPIError as exc:
+            self._count_a_failed_start(submitted and not lifecycle_transferred, outcome_sink, breaker_key)
             self.logger.warning("Video generation rejected (job_id=%s): %s", job_id, exc)
             return await self._pipe._ensure_error_formatter()._report_openrouter_error(
                 exc,
@@ -779,6 +789,7 @@ class VideoGenerationAdapter:
                 partial_answer=disclosure_block,
             )
         except Exception as exc:
+            self._count_a_failed_start(submitted and not lifecycle_transferred, outcome_sink, breaker_key)
             self.logger.exception("Video generation request failed (job_id=%s)", job_id)
             reason = str(exc) or exc.__class__.__name__
             content = self._build_failure_content(job_id=job_id, model_id=api_model_id, reason=reason)
@@ -800,6 +811,19 @@ class VideoGenerationAdapter:
                         release_user_slot=user_slot_acquired,
                     )
                 )
+
+    @staticmethod
+    def _settle_request(result: VideoLifecycleResult, outcome_sink: dict[str, Any] | None) -> None:
+        if outcome_sink is not None:
+            outcome_sink["error_occurred"] = result.failed or not result.file_id
+
+    def _count_a_failed_start(
+        self, sent_to_openrouter: bool, outcome_sink: dict[str, Any] | None, breaker_key: str | None
+    ) -> None:
+        if outcome_sink is not None:
+            outcome_sink["error_occurred"] = True
+        if sent_to_openrouter:
+            _record_failed_call(self._pipe, breaker_key)
 
     async def _cleanup_step(
         self, phase: str, key: tuple[str, str], what: str, coro: Awaitable[None]
@@ -868,6 +892,7 @@ class VideoGenerationAdapter:
         message_lock: asyncio.Lock,
         started_at: float,
         disclosure_block: str = "",
+        breaker_key: str | None = None,
     ) -> asyncio.Task[VideoLifecycleResult]:
         task: asyncio.Task[VideoLifecycleResult] = asyncio.create_task(
             self._run_lifecycle_after_submit(
@@ -887,6 +912,7 @@ class VideoGenerationAdapter:
                 message_lock=message_lock,
                 started_at=started_at,
                 disclosure_block=disclosure_block,
+                breaker_key=breaker_key,
             ),
             name=f"openrouter-video-{job_id}",
         )
@@ -942,6 +968,7 @@ class VideoGenerationAdapter:
         message_lock: asyncio.Lock,
         started_at: float,
         disclosure_block: str = "",
+        breaker_key: str | None = None,
     ) -> VideoLifecycleResult:
         content = ""
         failed = False
@@ -1142,6 +1169,7 @@ class VideoGenerationAdapter:
         except Exception as exc:
             self.logger.exception("Video lifecycle failed (job_id=%s)", job_id)
             failed = True
+            _record_failed_call(self._pipe, breaker_key)
             elapsed = max(0.0, time.monotonic() - started_at)
             reason = str(exc) or exc.__class__.__name__
             content = self._build_failure_content(job_id=job_id, model_id=api_model_id, reason=reason)
@@ -1281,9 +1309,11 @@ class VideoGenerationAdapter:
         self,
         task: asyncio.Task[VideoLifecycleResult],
         event_emitter: EventEmitter | None,
+        outcome_sink: dict[str, Any] | None = None,
     ) -> str:
         await self._emit_status(event_emitter, "Waiting for active video generation job...", done=False)
         result = await asyncio.shield(task)
+        self._settle_request(result, outcome_sink)
         await self._emit_status(event_emitter, result.status_description, done=True)
         await self._emit_completion(event_emitter, result.content, usage=result.usage)
         return result.content
