@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..pipe import Pipe
 
 from ..core.errors import OpenRouterAPIError
+from ..core.utils import drop_skeleton_rounds_without_reasoning
 from ..integrations.anthropic import _is_anthropic_model_id
 from .registry import ModelFamily
 
@@ -289,5 +290,5 @@ class ReasoningConfigManager:
                     changed = True
             cleaned.append(item)
         if changed:
-            responses_body.input = cleaned
+            responses_body.input = drop_skeleton_rounds_without_reasoning(cleaned)
         return changed

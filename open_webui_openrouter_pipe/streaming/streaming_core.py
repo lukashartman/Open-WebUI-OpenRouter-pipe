@@ -19,6 +19,7 @@ import random
 import re
 import time
 import uuid
+from collections import Counter
 from collections.abc import AsyncGenerator
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal
@@ -85,12 +86,14 @@ from ..core.utils import (
     SERVER_TOOL_FAILURE_STATUSES,
     SERVER_TOOL_IN_FLIGHT_STATUSES,
     SERVER_TOOL_SUCCESS_STATUSES,
+    TOOL_ROUND_SKELETON_KEY,
     _redact_payload_blobs,
     _render_error_template,
     _safe_json_loads,
     _serialize_marker,
     _serialize_phase_marker,
     citation_access_stamp,
+    continued_turn_counts,
     join_answer_and_card,
     merge_usage_stats,
     owui_call_status,
@@ -185,6 +188,7 @@ except (TypeError, ValueError):
 from ..api.transforms import _responses_input_to_chat_messages
 
 _monotonic = time.monotonic
+_UNRETAINED_TOOL_RESULT = "[tool result not retained]"
 
 
 def _citation_host(url: str) -> str:
@@ -547,7 +551,7 @@ class StreamingHandler:
 
         _loop_pipe_meta = metadata.get(_PIPE_METADATA_KEY)
         fusion_inner_call = bool(isinstance(_loop_pipe_meta, dict) and _loop_pipe_meta.get("fusion_inner"))
-        breaker_key_value = None if fusion_inner_call else (user_id or None)
+        breaker_key_value = user_id or None
 
         owui_tool_passthrough = valves.TOOL_EXECUTION_MODE == "Open-WebUI"
         persist_tools_enabled = valves.PERSIST_TOOL_RESULTS and (not owui_tool_passthrough)
@@ -557,6 +561,37 @@ class StreamingHandler:
                 isinstance(item, dict) and item.get("type") == "function_call_output"
                 for item in body.input
             )
+        open_webui_keeps_stored_output = bool(metadata.get("assistant_message_id"))
+        turn_result_call_ids: Counter[str] = Counter()
+        if owui_tool_passthrough and isinstance(body.input, list):
+            result_scope: list[dict[str, Any]] = []
+            scanned = [item for item in body.input if isinstance(item, dict)]
+            for index, item in enumerate(scanned):
+                if item.get("type") == "message" and item.get("role") == "user":
+                    following = scanned[index + 1] if index + 1 < len(scanned) else None
+                    carries_the_rounds_images = (
+                        bool(result_scope)
+                        and result_scope[-1].get("type") == "function_call_output"
+                        and (following is None or following.get("type") == "function_call")
+                    )
+                    if carries_the_rounds_images:
+                        continue
+                    result_scope = []
+                else:
+                    result_scope.append(item)
+            turn_result_call_ids = Counter(
+                item["call_id"]
+                for item in result_scope
+                if item.get("type") == "function_call_output" and isinstance(item.get("call_id"), str)
+            )
+        earlier_turn_calls, earlier_turn_texts, continues_after_reasoning = (
+            body._continued_turn if body._continued_turn is not None else continued_turn_counts(body.input)
+        )
+        open_webui_keeps_earlier_generations = bool(body.stream)
+        if not open_webui_keeps_earlier_generations:
+            earlier_turn_calls = 0
+            earlier_turn_texts = 0
+            continues_after_reasoning = False
         self.logger.debug(
             "🔧 TOOL_EXECUTION_MODE=%s owui_passthrough=%s PERSIST_TOOL_RESULTS=%s effective_persist_tools=%s is_continuation=%s",
             valves.TOOL_EXECUTION_MODE,
@@ -569,6 +604,12 @@ class StreamingHandler:
         streamed_tool_call_ids: set[str] = set()
         streamed_tool_call_indices: dict[str, int] = {}
         tool_call_names: dict[str, str] = {}
+
+        def _origin_tool_name(exposed_name: str) -> str:
+            raw_map = metadata.get("_pipe_exposed_to_origin") if isinstance(metadata, dict) else None
+            origin = raw_map.get(exposed_name) if isinstance(raw_map, dict) else None
+            return origin if isinstance(origin, str) and origin else exposed_name
+
         tool_call_item_ids: dict[str, str] = {}
         streamed_tool_call_args: dict[str, str] = {}
         streamed_tool_call_name_sent: set[str] = set()
@@ -610,12 +651,13 @@ class StreamingHandler:
         assistant_len_before_tool_loops = len(assistant_message)
         pending_ulids: list[str] = []
         pending_items: list[dict[str, Any]] = []
+        staged_skeleton_rows: list[dict[str, Any]] = []
         reasoning_anchor_state: dict[str, Any] = {
             "seq": 0,
-            "calls_seen": 0,
-            "stream_calls": 0,
-            "text_chunks": 0,
-            "chars_at_last_chunk": 0,
+            "calls_seen": earlier_turn_calls,
+            "stream_calls": earlier_turn_calls,
+            "text_chunks": earlier_turn_texts,
+            "chars_at_last_chunk": -1 if continues_after_reasoning else 0,
             "awaiting": [],
         }
         total_usage: dict[str, Any] = {}
@@ -909,6 +951,8 @@ class StreamingHandler:
             if seeded_output_items is not None:
                 return seeded_output_items
             seeded_output_items = []
+            if open_webui_keeps_stored_output:
+                return seeded_output_items
             if chat_id and message_id and Chats is not None:
                 try:
                     stored = await Chats.get_message_by_id_and_message_id(
@@ -924,9 +968,16 @@ class StreamingHandler:
                     return seeded_output_items
                 prior = (stored or {}).get("output")
                 if isinstance(prior, list):
-                    seeded_output_items = [
+                    stored_items = [
                         copy.deepcopy(entry) for entry in prior if isinstance(entry, dict)
                     ]
+                    stored_result_call_ids = Counter(
+                        entry["call_id"]
+                        for entry in stored_items
+                        if entry.get("type") == "function_call_output" and isinstance(entry.get("call_id"), str)
+                    )
+                    if turn_result_call_ids <= stored_result_call_ids:
+                        seeded_output_items = stored_items
             return seeded_output_items
 
         def _flush_recorded_message() -> None:
@@ -1297,22 +1348,25 @@ class StreamingHandler:
                 generation_started_at = now
 
         async def _append_assistant_hidden_markers(markers: list[str]) -> None:
-            """Append hidden markers via the assistant delta stream OWUI persists into output."""
             nonlocal assistant_message, retry_barrier_crossed
             if not markers:
                 return
             msg_before = len(assistant_message)
             assistant_message = _append_hidden_marker_lines(assistant_message, markers)
             marker_delta = assistant_message[msg_before:]
-            if marker_delta and body.stream and event_emitter:
+            if body.stream:
                 await event_emitter({"type": "chat:message:delta", "data": {"content": marker_delta}})
                 retry_barrier_crossed = True
-            else:
+            elif content_handed_back:
                 self.logger.warning(
-                    "Committed artifact row(s) left unaddressed: the marker delta was not "
-                    "published (reason=%s chat_id=%s markers=%s)",
-                    "no_delta" if not marker_delta
-                    else ("not_streaming" if not body.stream else "no_emitter"),
+                    "Committed artifact row(s) left unaddressed: the content was handed back before its "
+                    "markers were added (chat_id=%s markers=%s)",
+                    chat_id,
+                    markers,
+                )
+            else:
+                self.logger.debug(
+                    "Hidden markers added to the content this turn returns (chat_id=%s markers=%s)",
                     chat_id,
                     markers,
                 )
@@ -1382,6 +1436,7 @@ class StreamingHandler:
         loop_limit_reached = False
         retry_barrier_crossed = False
         handed_back_for_retry = False
+        content_handed_back = False
 
         def _record_outcome() -> None:
             if outcome_sink is None:
@@ -1391,6 +1446,7 @@ class StreamingHandler:
             outcome_sink["reason"] = session_log_reason or None
 
         try:
+            await _capture_seeded_output()
             for loop_index in range(valves.MAX_FUNCTION_CALL_LOOPS + 1):
                 if loop_index >= valves.MAX_FUNCTION_CALL_LOOPS and not loop_limit_reached:
                     break
@@ -1697,7 +1753,7 @@ class StreamingHandler:
                                 call_id, len(streamed_tool_call_indices)
                             )
                             raw_name = event.get("name") or tool_call_names.get(call_id)
-                            tool_name = raw_name.strip() if isinstance(raw_name, str) else ""
+                            tool_name = _origin_tool_name(raw_name.strip()) if isinstance(raw_name, str) else ""
                             if not tool_name:
                                 continue
 
@@ -2346,7 +2402,7 @@ class StreamingHandler:
 
                         continue
 
-                    if etype in ("response.completed", "response.done"):
+                    if etype in ("response.completed", "response.done", "response.incomplete"):
                         if reasoning_display:
                             _close_open_reasoning_windows()
                         if fusion_armed and fusion_batcher is not None:
@@ -2374,6 +2430,7 @@ class StreamingHandler:
                         break
 
                 if final_response is None:
+                    error_occurred = not fusion_inner_call
                     self.logger.warning("Stream ended without completion event for model=%s", body.model)
                     try:
                         template_vars = {
@@ -2562,7 +2619,7 @@ class StreamingHandler:
                         _prevs = [_m for _m, _p in enumerate(_fc_local) if _p < _i]
                         if _prevs:
                             _entry = ("preceding", _calls_seen + _prevs[-1])
-                        elif _calls_seen > 0:
+                        elif _calls_seen > earlier_turn_calls:
                             _entry = ("preceding", _calls_seen - 1)
                         else:
                             _entry = ("", -1)
@@ -2593,13 +2650,13 @@ class StreamingHandler:
                     elif _stream_consistent and isinstance(_stream_pos, int):
                         if _stream_pos < _stream_total:
                             _mode, _ordinal = "following", _stream_pos
-                        elif _stream_pos > 0:
+                        elif _stream_pos > earlier_turn_calls:
                             _mode, _ordinal = "preceding", _stream_pos - 1
                         else:
                             _mode, _ordinal = "", -1
                     elif _idx < len(_derived):
                         _mode, _ordinal = _derived[_idx]
-                    elif _calls_seen > 0:
+                    elif _calls_seen > earlier_turn_calls:
                         _mode, _ordinal = "preceding", _calls_seen - 1
                     else:
                         _mode, _ordinal = "", -1
@@ -2643,18 +2700,13 @@ class StreamingHandler:
 
                     if call_items and owui_tool_passthrough:
                         tool_calls_payload: list[dict[str, Any]] = []
-                        exposed_to_origin: dict[str, str] = {}
-                        if isinstance(metadata, dict):
-                            raw_map = metadata.get("_pipe_exposed_to_origin")
-                            if isinstance(raw_map, dict):
-                                exposed_to_origin = {str(k): str(v) for k, v in raw_map.items() if k and v}
                         try:
                             for call in call_items:
                                 raw_call_id = call.get("call_id") or call.get("id")
                                 call_id = raw_call_id.strip() if isinstance(raw_call_id, str) else ""
                                 raw_name = call.get("name")
                                 exposed_name = raw_name.strip() if isinstance(raw_name, str) else ""
-                                tool_name = exposed_to_origin.get(exposed_name, exposed_name)
+                                tool_name = _origin_tool_name(exposed_name)
                                 raw_args = call.get("arguments")
                                 if isinstance(raw_args, str):
                                     args_text = raw_args.strip() or "{}"
@@ -2718,6 +2770,7 @@ class StreamingHandler:
                             )
 
                         if not body.stream:
+                            content_handed_back = True
                             try:
                                 model_for_response = ""
                                 metadata_model = metadata.get("model") if isinstance(metadata, dict) else None
@@ -2766,6 +2819,7 @@ class StreamingHandler:
                                         (SessionLogger.request_id.get() or ""),
                                         json.dumps(summaries, ensure_ascii=False),
                                     )
+                                _record_outcome()
                                 return response
                             except Exception as exc:
                                 self.logger.warning(
@@ -3107,6 +3161,28 @@ class StreamingHandler:
                                 if thinking_tasks:
                                     cancel_thinking()
                                 await _flush_pending("function_outputs")
+                        elif valves.PERSIST_REASONING_TOKENS in {"next_reply", "conversation"}:
+                            for output in all_function_outputs:
+                                cid = _extract_call_id(output)
+                                call = call_by_id.get(cid) if cid else None
+                                if not call or (cid in emitted_tool_call_items and cid in emitted_tool_output_items):
+                                    continue
+                                for skeleton_item in (
+                                    {"type": "function_call", "call_id": cid, "name": call.get("name"),
+                                     "arguments": "{}", TOOL_ROUND_SKELETON_KEY: True},
+                                    {"type": "function_call_output", "call_id": cid, "output": _UNRETAINED_TOOL_RESULT,
+                                     "status": output.get("status"), TOOL_ROUND_SKELETON_KEY: True},
+                                ):
+                                    normalized_skeleton = normalize_persisted_item(skeleton_item)
+                                    row = (
+                                        self._pipe._artifact_store._make_db_row(
+                                            chat_id, message_id, openwebui_model, normalized_skeleton
+                                        )
+                                        if normalized_skeleton
+                                        else None
+                                    )
+                                    if row:
+                                        staged_skeleton_rows.append(row)
 
                         for output in all_function_outputs:
                             result_text = wrap_code_block(output.get("output", ""))
@@ -3209,6 +3285,24 @@ class StreamingHandler:
                     log_message=f"Server error in streaming loop: {e}",
                     partial_answer=assistant_message,
                 )
+            elif isinstance(e, (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError)):
+                if assistant_message.strip():
+                    template, variables = valves.STREAM_INTERRUPTED_TEMPLATE, {"model": body.model or ""}
+                elif isinstance(e, aiohttp.ConnectionTimeoutError):
+                    template, variables = valves.NETWORK_TIMEOUT_TEMPLATE, {"timeout_seconds": valves.HTTP_CONNECT_TIMEOUT_SECONDS}
+                elif isinstance(e, aiohttp.SocketTimeoutError):
+                    template, variables = valves.NETWORK_TIMEOUT_TEMPLATE, {"timeout_seconds": valves.HTTP_SOCK_READ_SECONDS}
+                elif isinstance(e, TimeoutError):
+                    template, variables = valves.NETWORK_TIMEOUT_TEMPLATE, {"timeout_seconds": valves.HTTP_TOTAL_TIMEOUT_SECONDS}
+                else:
+                    template, variables = valves.CONNECTION_ERROR_TEMPLATE, {"error_type": type(e).__name__}
+                reported = await self._pipe._ensure_error_formatter()._emit_templated_error(
+                    event_emitter,
+                    template=template,
+                    variables=variables,
+                    log_message=f"OpenRouter call failed in streaming loop: {type(e).__name__}: {e}",
+                    partial_answer=assistant_message,
+                )
             else:
                 reported = await self._pipe._ensure_error_formatter()._emit_templated_error(
                     event_emitter,
@@ -3263,7 +3357,9 @@ class StreamingHandler:
                     self.logger.debug("generation-complete dispatch failed", exc_info=True)
 
             if (not error_occurred) and (not was_cancelled):
-                await self._cleanup_replayed_reasoning(body, valves)
+                await self._cleanup_replayed_reasoning(
+                    body, valves, message_id if open_webui_keeps_earlier_generations else None
+                )
             if (not error_occurred) and (not was_cancelled) and event_emitter:
                 effective_start = stream_started_at or request_started_at
                 elapsed = max(0.0, perf_counter() - effective_start)
@@ -3446,6 +3542,8 @@ class StreamingHandler:
                         list(pending_ulids),
                     )
             else:
+                if reasoning_anchor_state["seq"] > 0:
+                    pending_items.extend(staged_skeleton_rows)
                 await _flush_pending("finalize")
                 if pending_ulids:
                     await _append_assistant_hidden_markers(
@@ -3608,7 +3706,9 @@ class StreamingHandler:
 
 
     @timed
-    async def _cleanup_replayed_reasoning(self, body: ResponsesBody, valves: Pipe.Valves) -> None:
+    async def _cleanup_replayed_reasoning(
+        self, body: ResponsesBody, valves: Pipe.Valves, message_id: str | None = None
+    ) -> None:
         """Delete once-used reasoning artifacts when retention is limited to the next reply."""
         if valves.PERSIST_REASONING_TOKENS != "next_reply":
             return
@@ -3616,7 +3716,7 @@ class StreamingHandler:
         if not refs:
             return
         setattr(body, "_replayed_reasoning_refs", [])  # noqa: B010 - undeclared dynamic attribute; setattr keeps pyright quiet
-        await self._pipe._artifact_store._delete_artifacts(refs)
+        await self._pipe._artifact_store._delete_artifacts(refs, keep_message_id=message_id)
 
 
     def _select_llm_endpoint(

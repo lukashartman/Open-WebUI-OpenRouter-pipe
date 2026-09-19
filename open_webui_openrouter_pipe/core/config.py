@@ -267,7 +267,7 @@ DEFAULT_NETWORK_TIMEOUT_TEMPLATE = (
 
 DEFAULT_CONNECTION_ERROR_TEMPLATE = (
     "### 🔌 Connection Failed\n\n"
-    "Unable to reach OpenRouter's servers.\n\n"
+    "The connection to OpenRouter failed, or ended before a reply arrived.\n\n"
     "**Error ID:** `{error_id}`\n"
     "{{#if error_type}}\n"
     "**Error type:** `{error_type}`\n"
@@ -279,12 +279,14 @@ DEFAULT_CONNECTION_ERROR_TEMPLATE = (
     "- Network connectivity issues\n"
     "- Firewall blocking HTTPS traffic\n"
     "- DNS resolution failure\n"
+    "- OpenRouter closed the connection without sending a reply\n"
     "- OpenRouter service outage\n\n"
     "**What to do:**\n"
-    "1. Check your internet connection\n"
-    "2. Verify firewall allows HTTPS (port 443)\n"
-    "3. Check [OpenRouter Status](https://status.openrouter.ai/)\n"
-    "4. Contact your network administrator if the issue persists\n"
+    "1. Try the message again\n"
+    "2. Check your internet connection\n"
+    "3. Verify firewall allows HTTPS (port 443)\n"
+    "4. Check [OpenRouter Status](https://status.openrouter.ai/)\n"
+    "5. Contact your network administrator if the issue persists\n"
     "{{#if support_email}}\n"
     "\n**Support:** {support_email}\n"
     "{{/if}}\n"
@@ -1341,17 +1343,7 @@ class Valves(BaseModel):
     OPENROUTER_ERROR_TEMPLATE: str = Field(
         default=DEFAULT_OPENROUTER_ERROR_TEMPLATE,
         description=(
-            "Markdown template used when OpenRouter rejects a request with a status that has no template of its own "
-            "(400, 403, 404, 422, and so on). Clear this box and save to restore this built-in text. "
-            "Placeholders such as {heading}, {detail}, {sanitized_detail}, {provider}, {model_identifier}, "
-            "{requested_model}, {api_model_id}, {normalized_model_id}, {openrouter_code}, {upstream_type}, "
-            "{reason}, {request_id}, {request_id_reference}, {openrouter_message}, {upstream_message}, "
-            "{moderation_reasons}, {flagged_excerpt}, {raw_body}, {context_limit_tokens}, {max_output_tokens}, "
-            "{include_model_limits}, {metadata_json}, {provider_raw_json}, {error_id}, {timestamp}, {session_id}, {user_id}, "
-            "{native_finish_reason}, {error_chunk_id}, {error_chunk_created}, {streaming_provider}, {streaming_model}, "
-            "{retry_after_seconds}, {rate_limit_type}, {required_cost}, and {account_balance} are replaced when values are available. "
-            "Lines containing placeholders are omitted automatically when the referenced value is missing or empty. "
-            "Supports Handlebars-style conditionals: wrap sections in {{#if variable}}...{{/if}} to show them only when that value is set."
+            "Markdown template used when OpenRouter rejects a request with a status that has no template of its own (400, 403, 404, 422, and so on), and when a failure reported inside a started reply resolves to such a status, from the kind OpenRouter named or, when that kind is unknown, from the code it sent. Clear this box and save to restore this built-in text. Placeholders such as {heading}, {detail}, {sanitized_detail}, {provider}, {model_identifier}, {requested_model}, {api_model_id}, {normalized_model_id}, {openrouter_code}, {upstream_type}, {reason}, {request_id}, {request_id_reference}, {openrouter_message}, {upstream_message}, {moderation_reasons}, {flagged_excerpt}, {raw_body}, {context_limit_tokens}, {max_output_tokens}, {include_model_limits}, {metadata_json}, {provider_raw_json}, {error_id}, {timestamp}, {session_id}, {user_id}, {native_finish_reason}, {error_chunk_id}, {error_chunk_created}, {streaming_provider}, {streaming_model}, {retry_after_seconds}, {rate_limit_type}, {required_cost}, and {account_balance} are replaced when values are available. Lines containing placeholders are omitted automatically when the referenced value is missing or empty. Supports Handlebars-style conditionals: wrap sections in {{#if variable}}...{{/if}} to show them only when that value is set."
         ),
     )
     ENDPOINT_OVERRIDE_CONFLICT_TEMPLATE: str = Field(
@@ -1372,47 +1364,35 @@ class Valves(BaseModel):
     AUTHENTICATION_ERROR_TEMPLATE: str = Field(
         default=DEFAULT_AUTHENTICATION_ERROR_TEMPLATE,
         description=(
-            "Markdown template for HTTP 401 errors, and for the pipe's own failure to read a usable API key. "
-            "Both cases fill {error_id}, {timestamp}, {session_id}, {user_id}, {support_email}, {support_url}, {openrouter_code} and {openrouter_message}. "
-            "A 401 returned by OpenRouter also fills the shared error-context fields — {request_id}, {provider}, {model_identifier}, {requested_model}, {reason}, {metadata_json} and the rest of the set the rejected-request template lists. "
-            "Nothing is sent when the key itself cannot be read, so on that path those extra fields have no value and any line using one prints the braces verbatim; wrap such a line in {{#if request_id}}...{{/if}} and it is left out instead. "
-            "A name nothing supplies is never substituted, whichever path rendered the card."
+            "Markdown template for HTTP 401 errors, for an authentication failure OpenRouter reports inside a reply it has already started, and for the pipe's own failure to read a usable API key. All three fill {error_id}, {timestamp}, {session_id}, {user_id}, {support_email}, {support_url}, {openrouter_code} and {openrouter_message}. A 401 returned by OpenRouter also fills the shared error-context fields — {request_id}, {provider}, {model_identifier}, {requested_model}, {reason}, {metadata_json} and the rest of the set the rejected-request template lists. A failure reported inside a started reply fills the same set, except for the fields OpenRouter has to send for them to exist: {request_id} only on the Responses transport, where the failed response carries its own id, and {provider} only when the error itself names the provider. Nothing is sent when the key itself cannot be read, so on that path those extra fields have no value and any line using one prints the braces verbatim; wrap such a line in {{#if request_id}}...{{/if}} and it is left out instead. A name nothing supplies is never substituted, whichever path rendered the card."
         ),
     )
 
     INSUFFICIENT_CREDITS_TEMPLATE: str = Field(
         default=DEFAULT_INSUFFICIENT_CREDITS_TEMPLATE,
         description=(
-            "Markdown template for HTTP 402 errors when the account is out of credits. Supports {error_id}, {timestamp}, {openrouter_code}, "
-            "{openrouter_message}, {request_id}, {required_cost}, {account_balance}, {support_email}, and other shared context variables. "
-            "{request_id} is OpenRouter's own reference for the rejected request, which its support can look up; the built-in text shows it on its own row whenever the rejection carried one."
+            "Markdown template for HTTP 402 errors when the account is out of credits, and for a payment_required failure OpenRouter reports inside a reply it has already started. Supports {error_id}, {timestamp}, {openrouter_code}, {openrouter_message}, {request_id}, {required_cost}, {account_balance}, {support_email}, and other shared context variables. {request_id} is OpenRouter's own reference for the rejected request, which its support can look up; the built-in text shows it on its own row whenever the rejection carried one."
         ),
     )
 
     RATE_LIMIT_TEMPLATE: str = Field(
         default=DEFAULT_RATE_LIMIT_TEMPLATE,
         description=(
-            "Markdown template for HTTP 429 rate-limit errors. Use placeholders such as {error_id}, {timestamp}, {openrouter_code}, {retry_after_seconds}, "
-            "{rate_limit_type}, {request_id}, {support_email}, and the standard context variables. "
-            "{request_id} is OpenRouter's own reference for the rejected request, which its support can look up; the built-in text shows it on its own row whenever the rejection carried one."
+            "Markdown template for HTTP 429 rate-limit errors, and for a rate_limit_exceeded failure OpenRouter reports inside a reply it has already started. Use placeholders such as {error_id}, {timestamp}, {openrouter_code}, {retry_after_seconds}, {rate_limit_type}, {request_id}, {support_email}, and the standard context variables. {request_id} is OpenRouter's own reference for the rejected request, which its support can look up; the built-in text shows it on its own row whenever the rejection carried one."
         ),
     )
 
     SERVER_TIMEOUT_TEMPLATE: str = Field(
         default=DEFAULT_SERVER_TIMEOUT_TEMPLATE,
         description=(
-            "Markdown template for HTTP 408 errors returned by OpenRouter (server-side timeout). Supports the common context variables plus "
-            "{openrouter_message}, {openrouter_code}, {request_id}, and support contact placeholders. "
-            "{request_id} is OpenRouter's own reference for the timed-out request, which its support can look up; the built-in text shows it on its own row whenever the response carried one."
+            "Markdown template for a 408 from OpenRouter (server-side timeout), whether that is the reply's own status or the code reported inside a reply already under way. A provider timeout reported inside a started reply is documented as 504 and renders SERVICE_ERROR_TEMPLATE instead. Supports the common context variables plus {openrouter_message}, {openrouter_code}, {request_id}, and support contact placeholders. {request_id} is OpenRouter's own reference for the timed-out request, which its support can look up; the built-in text shows it on its own row whenever the response carried one."
         ),
     )
 
     PAYLOAD_TOO_LARGE_TEMPLATE: str = Field(
         default=DEFAULT_PAYLOAD_TOO_LARGE_TEMPLATE,
         description=(
-            "Markdown template for HTTP 413 errors when the request payload exceeds size limits. Supports {error_id}, {timestamp}, {openrouter_code}, "
-            "{openrouter_message}, {model_identifier}, {request_id}, {support_email}, and other shared context variables. "
-            "{request_id} is OpenRouter's own reference for the rejected request, which its support can look up; the built-in text shows it on its own row whenever the rejection carried one."
+            "Markdown template for HTTP 413 errors when the request payload exceeds size limits, and for a payload_too_large failure OpenRouter reports inside a reply it has already started. Supports {error_id}, {timestamp}, {openrouter_code}, {openrouter_message}, {model_identifier}, {request_id}, {support_email}, and other shared context variables. {request_id} is OpenRouter's own reference for the rejected request, which its support can look up; the built-in text shows it on its own row whenever the rejection carried one."
         ),
     )
 
@@ -1437,31 +1417,21 @@ class Valves(BaseModel):
     NETWORK_TIMEOUT_TEMPLATE: str = Field(
         default=DEFAULT_NETWORK_TIMEOUT_TEMPLATE,
         description=(
-            "Markdown template for network timeout errors. "
-            "Available variables: {error_id}, {timeout_seconds}, {timestamp}, "
-            "{session_id}, {user_id}, {support_email}. "
-            "Supports Handlebars-style conditionals: wrap sections in {{#if variable}}...{{/if}} to show them only when that value is set."
+            "Markdown template a chat reply shows, after any retries, when its call to OpenRouter times out before any of the answer arrives. Picture-only image models, video models and the panel, judge and final-answer calls inside internal Fusion report failures in their own way. {timeout_seconds} is the limit that ran out: HTTP_CONNECT_TIMEOUT_SECONDS while connecting, HTTP_SOCK_READ_SECONDS while waiting for data, or HTTP_TOTAL_TIMEOUT_SECONDS for the whole request. Once part of the answer has arrived, STREAM_INTERRUPTED_TEMPLATE is used instead. Available variables: {error_id}, {timeout_seconds}, {timestamp}, {session_id}, {user_id}, {support_email}, {support_url}. Supports Handlebars-style conditionals: wrap a section in {{#if variable}}...{{/if}} to show it only when that value is set."
         )
     )
 
     CONNECTION_ERROR_TEMPLATE: str = Field(
         default=DEFAULT_CONNECTION_ERROR_TEMPLATE,
         description=(
-            "Markdown template for connection failures. "
-            "Available variables: {error_id}, {error_type}, {timestamp}, "
-            "{session_id}, {user_id}, {support_email}. "
-            "Supports Handlebars-style conditionals: wrap sections in {{#if variable}}...{{/if}} to show them only when that value is set."
+            "Markdown template a chat reply shows, after any retries, when its connection to OpenRouter fails before any of the answer arrives: the connection cannot be opened or drops, or, on every attempt, OpenRouter closes the stream without sending anything. Picture-only image models, video models and the panel, judge and final-answer calls inside internal Fusion report failures in their own way. A timeout uses NETWORK_TIMEOUT_TEMPLATE instead, and once part of the answer has arrived, STREAM_INTERRUPTED_TEMPLATE is used. Available variables: {error_id}, {error_type}, {timestamp}, {session_id}, {user_id}, {support_email}, {support_url}. Supports Handlebars-style conditionals: wrap a section in {{#if variable}}...{{/if}} to show it only when that value is set."
         )
     )
 
     SERVICE_ERROR_TEMPLATE: str = Field(
         default=DEFAULT_SERVICE_ERROR_TEMPLATE,
         description=(
-            "Markdown template for OpenRouter 5xx errors. "
-            "Available variables: {error_id}, {status_code}, {reason}, {timestamp}, "
-            "{session_id}, {user_id}, {support_email}. "
-            "A 5xx that OpenRouter itself returned also fills {request_id}, its own reference for that request; a 5xx raised by the connection to OpenRouter, or by a failure inside the pipe, carries no such reference and a line using it prints the braces verbatim unless it is wrapped in a conditional. "
-            "Supports Handlebars-style conditionals: wrap sections in {{#if variable}}...{{/if}} to show them only when that value is set."
+            "Markdown template for OpenRouter 5xx errors, and for a failure OpenRouter reports inside a reply it has already started under one of its own typed codes: provider_unavailable, provider_overloaded, timeout, server or unmapped, or under its native code server_error. Available variables: {error_id}, {status_code}, {reason}, {timestamp}, {session_id}, {user_id}, {support_email}. A 5xx that OpenRouter itself returned also fills {request_id}, its own reference for that request. A 5xx reported inside a started reply fills it only on the Responses transport, because on Chat Completions the id OpenRouter sends is carried as {error_chunk_id} instead; {provider} likewise appears only when the error names the provider. A 5xx raised by the connection to OpenRouter, or by a failure inside the pipe, carries no such reference and a line using it prints the braces verbatim unless it is wrapped in a conditional. Supports Handlebars-style conditionals: wrap sections in {{#if variable}}...{{/if}} to show them only when that value is set."
         )
     )
 
@@ -1487,9 +1457,7 @@ class Valves(BaseModel):
     STREAM_INTERRUPTED_TEMPLATE: str = Field(
         default=DEFAULT_STREAM_INTERRUPTED_TEMPLATE,
         description=(
-            "Markdown template appended to the assistant message when the streaming response ends "
-            "without a completion event. The partial content is preserved and this notice is appended. "
-            "Available variables: {model}, {timestamp}, {support_email}, {support_url}."
+            "Markdown template appended to the assistant message when a reply's stream stops before its final event: the stream closes early or, after answer text has arrived, its connection fails, drops or times out. Any partial content is kept, with this notice after it. The panel, judge and final-answer calls inside internal Fusion never get this notice. When none of the answer has arrived, NETWORK_TIMEOUT_TEMPLATE is used instead for a timeout, and CONNECTION_ERROR_TEMPLATE for a failed connection or a stream that sent nothing. Available variables: {model}, {timestamp}, {support_email}, {support_url}."
         ),
     )
 
@@ -1497,42 +1465,49 @@ class Valves(BaseModel):
         default=200,
         ge=1,
         le=2000,
-        description="Global ceiling for simultaneously executing tool calls.",
+        description=(
+            "Global ceiling for simultaneously executing tool calls; Open WebUI's ask_user takes no slot."
+        ),
     )
     MAX_PARALLEL_TOOLS_PER_REQUEST: int = Field(
         default=5,
         ge=1,
         le=50,
-        description="Per-request concurrency limit for tool execution workers.",
+        description=(
+            "Per-request limit on simultaneously executing tool calls, and the number of tool workers each request starts. Each internal Fusion model starts the same number of workers and shares the request's slots; Open WebUI's ask_user takes no slot."
+        ),
     )
     BREAKER_MAX_FAILURES: int = Field(
         default=5,
         ge=1,
         le=50,
         description=(
-            "Number of failures allowed per breaker window before that user's requests, tools, or database writes are temporarily blocked. "
-            "Set higher to reduce trip frequency in noisy environments."
+            "Number of failures one user may accumulate before their requests are refused, a failing tool is skipped, or their database reads and writes are skipped; raise it for fewer trips in noisy environments. A request failure is a failed chat call to OpenRouter (an error reply; a connection that cannot be opened, drops or times out; an error reported inside a response; or a stream that stops before its final event), counted again on each automatic retry. A generation on a picture-only image model or a video model that fails after it was sent to OpenRouter is also a request failure, counted once. Request and database failures count within BREAKER_WINDOW_SECONDS. Request failures clear when a request ends without an error (for a picture-only image model or a video model, only once its result is delivered; for an internal Fusion run, only if a panel model answered); a request the user stops clears no request failures. Housekeeping tasks such as title generation neither count nor clear; Open WebUI's merge-responses task counts but never clears. Database failures also clear when a database operation succeeds. The request breaker never refuses a request whose last message is a tool result or a user message right after a tool result. Each tool counts its failures in a row."
         ),
     )
     BREAKER_WINDOW_SECONDS: int = Field(
         default=60,
         ge=5,
         le=900,
-        description="Sliding window length (in seconds) used when counting breaker failures.",
+        description=(
+            "Number of seconds a failure keeps counting. The request and database breakers use it as a trailing window. A tool's failure count clears on a success, or when the tool is next called more than this long after its last failure; inside an internal Fusion run, only a success clears the run's count for that tool."
+        ),
     )
     BREAKER_HISTORY_SIZE: int = Field(
         default=5,
         ge=1,
         le=200,
         description=(
-            "Maximum failures the per-user database circuit breaker remembers. Keep at or above BREAKER_MAX_FAILURES so history is not truncated below the trip count (the request and per-tool breakers size their own history automatically)."
+            "How many failure timestamps the per-user database breaker keeps, never fewer than BREAKER_MAX_FAILURES; a larger value has no effect on when that breaker trips or recovers. The request and per-tool breakers keep BREAKER_MAX_FAILURES."
         ),
     )
     TOOL_BATCH_CAP: int = Field(
         default=4,
         ge=1,
         le=32,
-        description="Maximum number of compatible tool calls that may be executed in a single batch.",
+        description=(
+            "Maximum number of consecutive calls to one tool that may run in a single batch."
+        ),
     )
     TOOL_OUTPUT_RETENTION_TURNS: int = Field(
         default=10,
@@ -1545,27 +1520,32 @@ class Valves(BaseModel):
         ),
     )
     TOOL_TIMEOUT_SECONDS: int = Field(
-        default=60,
+        default=300,
         ge=1,
         le=600,
-        description="Max seconds to wait for an individual tool to finish before timing out. Generous default reduces disruption for real-world tools.",
+        description=(
+            "Maximum seconds one tool call may run, counted from when it starts; Open WebUI's built-in ask_user waits for its question window plus 15 seconds instead. A timed-out call counts as a failure of that tool; the generous default reduces disruption for real-world tools."
+        ),
     )
     TOOL_BATCH_TIMEOUT_SECONDS: int = Field(
-        default=120,
+        default=600,
         ge=1,
-        description="Max seconds to wait for a batch of tool calls to complete before timing out. Longer default keeps complex batches from being interrupted prematurely.",
+        description=(
+            "Maximum seconds a batch of calls to one tool may take, including time spent waiting for a slot, and never less than TOOL_TIMEOUT_SECONDS. When the limit is reached, finished calls keep their results and calls still running or waiting are cancelled."
+        ),
     )
     TOOL_IDLE_TIMEOUT_SECONDS: int | None = Field(
         default=None,
         ge=1,
-        description="Idle timeout (seconds) between tool executions in a queue. Set to null for unlimited idle time so intermittent tool usage does not fail unexpectedly.",
+        description=(
+            "Maximum seconds to wait for each tool call's result before reporting that call as timed out; Open WebUI's ask_user waits at least its question window. On timeout, a call that is already running continues until it finishes, another tool limit ends it, or request cleanup cancels it after TOOL_SHUTDOWN_TIMEOUT_SECONDS (inside internal Fusion, without that wait, as soon as the calling model's answer ends). The model never receives the late result, though files or embeds the call returns can still appear in the chat. A call still waiting for a slot or a worker never starts. Null means no limit, leaving TOOL_TIMEOUT_SECONDS and TOOL_BATCH_TIMEOUT_SECONDS in charge."
+        ),
     )
     TOOL_SHUTDOWN_TIMEOUT_SECONDS: float = Field(
         default=10.0,
         ge=0,
         description=(
-            "Maximum seconds to wait for that request's running tools to finish and stop during cleanup. "
-            "0 disables the graceful wait and cancels workers immediately."
+            "Maximum seconds to wait for a request's unfinished tool calls to finish during cleanup; after a Stop, calls that had not started can still start in this time. 0 disables the graceful wait and cancels workers immediately. Inside internal Fusion, a model's tool workers are cancelled without this wait as soon as that model's answer ends."
         ),
     )
     ENABLE_REDIS_CACHE: bool = Field(

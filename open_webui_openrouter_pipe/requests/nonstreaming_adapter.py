@@ -98,6 +98,7 @@ class NonStreamingAdapter:
                 api_key=api_key,
                 base_url=base_url,
                 valves=effective_valves,
+                breaker_key=breaker_key,
                 user=user,
                 owui_chat_id=owui_chat_id,
             )

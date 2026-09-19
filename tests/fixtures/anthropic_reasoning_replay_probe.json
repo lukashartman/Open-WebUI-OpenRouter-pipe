@@ -1,0 +1,259 @@
+{
+  "model": "anthropic/claude-opus-4.8",
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "interleaved_thinking_beta_header": true,
+  "note": "Replays of one signed opus-4.8 tool turn (two sequential tool rounds) and one with two parallel calls and final-round reasoning, sent as the next request's history. Only thinking blocks placed next to each other were rejected; text position, stubbed tool results and stubbed arguments were all accepted.",
+  "sequential_rounds": {
+    "recorded": "2026-09-15 00:09 (t52b), 00:49 (t52d)",
+    "arms": {
+      "T52": {
+        "status": 400,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "reasoning",
+          "message:user"
+        ],
+        "error": "messages.1.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."
+      },
+      "T52_FIRST": {
+        "status": 400,
+        "shape": [
+          "message:user",
+          "reasoning",
+          "reasoning",
+          "message:assistant",
+          "message:user"
+        ],
+        "error": "messages.1.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response."
+      },
+      "CTRL_FULL": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "reasoning",
+          "message:assistant",
+          "function_call",
+          "function_call_output",
+          "reasoning",
+          "message:assistant",
+          "function_call",
+          "function_call_output",
+          "message:assistant",
+          "message:user"
+        ]
+      },
+      "CTRL_NONE": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "message:user"
+        ]
+      },
+      "V1_STUB": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "message:user"
+        ]
+      },
+      "V1_REAL": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "message:user"
+        ]
+      },
+      "V8_REAL": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "message:assistant",
+          "message:user"
+        ]
+      },
+      "V8_STUB": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "message:assistant",
+          "message:user"
+        ]
+      }
+    }
+  },
+  "parallel_calls_with_final_round_reasoning": {
+    "recorded": "2026-09-15 00:54 (t52f)",
+    "arms": {
+      "CTRL_FULL": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "reasoning",
+          "message:assistant",
+          "function_call",
+          "function_call",
+          "function_call_output",
+          "function_call_output",
+          "reasoning",
+          "message:assistant",
+          "message:user"
+        ]
+      },
+      "V3_PAIRED": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "reasoning",
+          "message:assistant",
+          "function_call",
+          "function_call_output",
+          "function_call",
+          "function_call_output",
+          "reasoning",
+          "message:assistant",
+          "message:user"
+        ]
+      },
+      "PIPE_STUB": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "function_call",
+          "function_call_output",
+          "reasoning",
+          "message:user"
+        ]
+      },
+      "PIPE_REAL": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "function_call",
+          "function_call_output",
+          "reasoning",
+          "message:user"
+        ]
+      },
+      "GROUPED_STUB": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call",
+          "function_call_output",
+          "function_call_output",
+          "reasoning",
+          "message:user"
+        ]
+      }
+    }
+  },
+  "stubbed_arguments": {
+    "recorded": "2026-09-15 01:09 (t52g); every function_call.arguments replaced by \"{}\"",
+    "arms": {
+      "B_ARGS_KEPT": {
+        "status": 200
+      },
+      "B_ARGS_EMPTY": {
+        "status": 200
+      },
+      "F_ARGS_KEPT": {
+        "status": 200
+      },
+      "F_ARGS_EMPTY": {
+        "status": 200
+      }
+    }
+  },
+  "continue_of_a_tool_turn": {
+    "recorded": "2026-09-16 22:33-22:37 (t126), the saved t52b turn replayed as a Continue with no trailing user message",
+    "note": "A Continue sends the history ending inside the continued assistant turn. Ending on the turn's skeleton result was accepted; ending on the assistant's text was rejected by the model, with or without reasoning in the request. On the answer cut after round 1 the model called its tool again in both accepted runs.",
+    "arms": {
+      "A_FULL": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output",
+          "reasoning",
+          "function_call",
+          "function_call_output"
+        ]
+      },
+      "B_FULL": {
+        "status": 400,
+        "shape": [
+          "message:user",
+          "message:assistant"
+        ],
+        "error": "This model does not support assistant message prefill. The conversation must end with a user message."
+      },
+      "A_CUT": {
+        "status": 200,
+        "shape": [
+          "message:user",
+          "message:assistant",
+          "reasoning",
+          "function_call",
+          "function_call_output"
+        ]
+      },
+      "B_CUT": {
+        "status": 400,
+        "shape": [
+          "message:user",
+          "message:assistant"
+        ],
+        "error": "This model does not support assistant message prefill. The conversation must end with a user message."
+      }
+    }
+  }
+}

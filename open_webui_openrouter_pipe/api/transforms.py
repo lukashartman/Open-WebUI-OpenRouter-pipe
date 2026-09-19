@@ -18,7 +18,14 @@ import logging
 from collections.abc import Awaitable, Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -36,9 +43,11 @@ from ..core.config import (
 )
 from ..core.timing_logger import timed
 from ..core.utils import (
+    TOOL_ROUND_SKELETON_KEY,
     _coerce_bool,
     _parse_model_fallback_csv,
     _sticky_session_key,
+    drop_skeleton_rounds_without_reasoning,
     strip_hidden_marker_lines,
 )
 from ..filters.fusion_filter_renderer import is_fusion_model
@@ -95,6 +104,7 @@ class ResponsesBody(BaseModel):
     stop_server_tools_when: list[dict[str, Any]] | None = None
     user: str | None = None
     session_id: str | None = None
+    _continued_turn: tuple[int, int, bool] | None = PrivateAttr(default=None)
 
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
@@ -755,6 +765,9 @@ def _responses_input_to_chat_messages(
         return [{"role": "user", "content": text}] if text else []
     if not isinstance(input_value, list):
         return []
+    input_value = drop_skeleton_rounds_without_reasoning(
+        [item for item in input_value if not (isinstance(item, dict) and item.get("type") == "reasoning")]
+    )
 
     messages: list[dict[str, Any]] = []
 
@@ -1596,6 +1609,14 @@ def _filter_openrouter_request(payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             if not value:
                 continue
+
+        if key == "input" and isinstance(value, list):
+            value = [
+                {name: item_value for name, item_value in item.items() if name != TOOL_ROUND_SKELETON_KEY}
+                if isinstance(item, dict) and TOOL_ROUND_SKELETON_KEY in item
+                else item
+                for item in value
+            ]
         filtered[key] = value
 
     return filtered

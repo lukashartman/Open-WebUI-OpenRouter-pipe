@@ -2857,7 +2857,7 @@ async def test_delete_artifacts_deletes_redis_cache(pipe_instance) -> None:
             return len(keys)
 
     store._redis_client = _FakeRedis()
-    store._delete_artifacts_sync = lambda _ids: None  # type: ignore[assignment]
+    store._delete_artifacts_sync = lambda _ids, _keep_message_id=None: set()  # type: ignore[assignment]
 
     await store._delete_artifacts([("chat", "id-1"), ("chat", "id-2")])
 
@@ -2948,9 +2948,179 @@ async def test_delete_artifacts_tolerates_redis_error(pipe_instance) -> None:
             raise RuntimeError("redis down")
 
     store._redis_client = _BoomRedis()
-    store._delete_artifacts_sync = lambda _ids: None  # type: ignore[assignment]
+    store._delete_artifacts_sync = lambda _ids, _keep_message_id=None: set()  # type: ignore[assignment]
 
     await store._delete_artifacts([("chat", "id-1")])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kept", ["m-writing", "m-earlier"])
+async def test_a_cleanup_that_keeps_a_message_spares_its_rows_and_their_cached_copies(pipe_instance, kept) -> None:
+    """Next-reply cleanup keeps the rows of the message a request is still writing. With Redis write-behind a kept row
+    may still be waiting in the queue and readable only from its cached copy, so that copy must survive too."""
+    from sqlalchemy.pool import StaticPool
+
+    store = pipe_instance._artifact_store
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    with _install_internal_db(engine):
+        store._init_artifact_store(pipe_identifier="pipe", table_fragment="pipe")
+    try:
+        rows = [
+            _make_row("chat", "m-earlier", {"type": "reasoning", "text": "earlier"}),
+            _make_row("chat", "m-writing", {"type": "reasoning", "text": "writing"}),
+        ]
+        await store._db_persist(rows)
+        ids_by_message = {row["message_id"]: row["id"] for row in rows}
+        dropped = next(message for message in ids_by_message if message != kept)
+        deleted_keys: list[str] = []
+
+        class _FakeRedis:
+            def delete(self, *keys):
+                deleted_keys.extend(keys)
+                return len(keys)
+
+        store._redis_enabled = True
+        store._redis_client = _FakeRedis()
+
+        await store._delete_artifacts([("chat", row_id) for row_id in ids_by_message.values()], keep_message_id=kept)
+
+        assert sorted(store._db_fetch_sync("chat", None, list(ids_by_message.values()))) == [ids_by_message[kept]]
+        assert deleted_keys == [store._redis_cache_key("chat", ids_by_message[dropped])]
+    finally:
+        store._redis_enabled = False
+        store._redis_client = None
+        engine.dispose()
+
+
+
+class _WriteBehindRedis:
+    """In-memory Redis for the write-behind path. Its pending list, cached rows and plain keys really change, so a test
+    can build rows that are queued and cached but not yet in the table."""
+
+    def __init__(self):
+        self.values: dict[str, Any] = {}
+        self.lists: dict[str, list[str]] = {}
+
+    def pipeline(self):
+        outer = self
+        commands: list[Any] = []
+
+        class _Pipe:
+            def rpush(self, key, value):
+                commands.append(lambda: outer.lists.setdefault(key, []).append(value))
+                return self
+
+            def lpush(self, key, value):
+                commands.append(lambda: outer.lists.setdefault(key, []).insert(0, value))
+                return self
+
+            def setex(self, key, _ttl, value):
+                commands.append(lambda: outer.values.__setitem__(key, value))
+                return self
+
+            def execute(self):
+                return [command() for command in commands]
+
+        return _Pipe()
+
+    def publish(self, _channel, _message):
+        return 0
+
+    def mget(self, keys):
+        return [self.values.get(key) for key in keys]
+
+    def delete(self, *keys):
+        return sum(self.values.pop(key, None) is not None for key in keys)
+
+    def lpop(self, key):
+        values = self.lists.get(key, [])
+        return values.pop(0) if values else None
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    def eval(self, _script, _numkeys, key, token):
+        # Stands in for Redis's EVAL command, which the flusher uses to release its lock; it runs no code.
+        if self.values.get(key) != token:
+            return 0
+        del self.values[key]
+        return 1
+
+
+@contextlib.contextmanager
+def _write_behind_store(pipe):
+    """The pipe's artifact store on an in-memory SQLite database, with Redis write-behind on from the start."""
+    from sqlalchemy.pool import StaticPool
+
+    store = pipe._artifact_store
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    with _install_internal_db(engine):
+        store._init_artifact_store(pipe_identifier="pipe", table_fragment="pipe")
+    store._redis_enabled = True
+    store._redis_client = _WriteBehindRedis()
+    try:
+        yield store
+    finally:
+        store._redis_enabled = False
+        store._redis_client = None
+        engine.dispose()
+
+
+async def _queued_rows(store) -> dict[str, str]:
+    rows = [
+        _make_row("chat", "m-earlier", {"type": "reasoning", "text": "earlier"}),
+        _make_row("chat", "m-writing", {"type": "reasoning", "text": "writing"}),
+    ]
+    await store._db_persist(rows)
+    ids_by_message = {row["message_id"]: row["id"] for row in rows}
+    assert store._db_fetch_sync("chat", None, list(ids_by_message.values())) == {}
+    assert len(store._redis_client.lists[store._redis_pending_key]) == 2
+    return ids_by_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kept", ["m-writing", "m-earlier"])
+async def test_a_cleanup_that_keeps_a_message_spares_its_rows_still_waiting_to_be_written(pipe_instance, kept) -> None:
+    """With Redis write-behind a row waits in the queue, readable only from its cached copy, until a flush writes it.
+    Cleanup must leave the kept message's queued rows readable and make the other message's rows unreadable."""
+    with _write_behind_store(pipe_instance) as store:
+        ids_by_message = await _queued_rows(store)
+        ids = list(ids_by_message.values())
+
+        await store._delete_artifacts([("chat", row_id) for row_id in ids], keep_message_id=kept)
+
+        assert sorted(await store._db_fetch("chat", None, ids)) == [ids_by_message[kept]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup", ["before-the-flush", "while-the-flush-writes"])
+async def test_rows_cleaned_up_while_waiting_to_be_written_never_stay_in_the_table(
+    pipe_instance, monkeypatch, cleanup
+) -> None:
+    """A message's rows can still be queued when next-reply cleanup drops the message, or be inside a flush on their
+    way to the table. Either way they must not stay in the table, while the kept message's rows are written."""
+    with _write_behind_store(pipe_instance) as store:
+        ids_by_message = await _queued_rows(store)
+        ids = list(ids_by_message.values())
+        refs = [("chat", row_id) for row_id in ids]
+
+        if cleanup == "before-the-flush":
+            await store._delete_artifacts(refs, keep_message_id="m-writing")
+        else:
+            write = store._db_persist_direct
+
+            async def cleanup_then_write(rows, user_id=""):
+                await store._delete_artifacts(refs, keep_message_id="m-writing")
+                return await write(rows, user_id=user_id)
+
+            monkeypatch.setattr(store, "_db_persist_direct", cleanup_then_write)
+        await store._flush_redis_queue()
+
+        assert store._redis_client.lists[store._redis_pending_key] == []
+        assert sorted(store._db_fetch_sync("chat", None, ids)) == [ids_by_message["m-writing"]]
 
 
 @pytest.mark.asyncio
@@ -3242,3 +3412,101 @@ def test_dedupe_tools_prefers_latest_definition():
     assert len(deduped) == 2
     assert deduped[0]["parameters"]["properties"] == {"query": {"type": "string"}}
     assert deduped[1]["mode"] == "fast"
+
+
+# --- a save that Redis accepts clears the user's database failures ---------------------------------------------------
+
+
+class _AcceptingRedis:
+    """A Redis stand-in that takes every queued row, as a healthy write-behind deployment does."""
+
+    def __init__(self):
+        self.queued: list[str] = []
+
+    def pipeline(self):
+        outer = self
+
+        class _Pipe:
+            def rpush(self, key, value):
+                outer.queued.append(value)
+                return self
+
+            def setex(self, key, ttl, value):
+                return self
+
+            def execute(self):
+                return []
+
+        return _Pipe()
+
+    def publish(self, channel, message):
+        return 1
+
+
+class _RefusingRedis(_AcceptingRedis):
+    """A Redis stand-in whose queue write fails, so the store falls back to writing the database directly."""
+
+    def pipeline(self):
+        class _Pipe:
+            def rpush(self, key, value):
+                return self
+
+            def setex(self, key, ttl, value):
+                return self
+
+            def execute(self):
+                raise ConnectionError("redis is down")
+
+        return _Pipe()
+
+
+async def _save_one_row_as(store, user_id: str) -> list[str]:
+    from open_webui_openrouter_pipe.core.logging_system import SessionLogger
+
+    token = SessionLogger.user_id.set(user_id)
+    try:
+        return await store._db_persist(
+            [{"chat_id": "c", "message_id": "m", "item_type": "reasoning", "payload": {"text": "kept"}}]
+        )
+    finally:
+        SessionLogger.user_id.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_failures", [1, 2])
+async def test_a_save_handed_to_redis_clears_the_users_database_failures(pipe_instance, earlier_failures):
+    """With Redis write-behind, handing the rows to Redis is how a save succeeds, so it clears the count."""
+    store = pipe_instance._artifact_store
+    store._redis_enabled = True
+    store._redis_client = _AcceptingRedis()
+    store.configure_breaker(earlier_failures + 1, 600)
+    for _ in range(earlier_failures):
+        store._record_db_failure("user-1")
+    assert len(store._db_breakers["user-1"]) == earlier_failures
+
+    saved = await _save_one_row_as(store, "user-1")
+
+    assert saved and len(store._redis_client.queued) == 1, "the row was not handed to Redis"
+    assert len(store._db_breakers["user-1"]) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_failures", [1, 2])
+async def test_a_save_neither_redis_nor_the_database_takes_keeps_the_users_database_failures(
+    pipe_instance, earlier_failures
+):
+    """The count clears on an accepted save only: when Redis refuses and the direct write cannot run, it grows."""
+    store = pipe_instance._artifact_store
+    store._redis_enabled = True
+    store._redis_client = _RefusingRedis()
+    store._item_model = None
+    store._session_factory = None
+    store._db_executor = None
+    store.configure_breaker(earlier_failures + 2, 600)
+    for _ in range(earlier_failures):
+        store._record_db_failure("user-1")
+
+    saved = await _save_one_row_as(store, "user-1")
+
+    assert saved == []
+    assert len(store._db_breakers["user-1"]) == earlier_failures + 1

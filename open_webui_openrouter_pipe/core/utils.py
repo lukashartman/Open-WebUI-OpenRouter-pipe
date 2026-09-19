@@ -67,12 +67,67 @@ REASONING_ANCHOR_SEQ_KEY = "_anchor_seq"
 REASONING_FOLLOWING_ORDINAL_KEY = "_anchor_following_call_ordinal"
 REASONING_PRECEDING_ORDINAL_KEY = "_anchor_preceding_call_ordinal"
 REASONING_TEXT_ORDINAL_KEY = "_anchor_text_ordinal"
+TOOL_ROUND_SKELETON_KEY = "_anchor_tool_round_skeleton"
 REASONING_ANCHOR_KEYS = (
     REASONING_ANCHOR_SEQ_KEY,
     REASONING_FOLLOWING_ORDINAL_KEY,
     REASONING_PRECEDING_ORDINAL_KEY,
     REASONING_TEXT_ORDINAL_KEY,
 )
+
+
+def continued_turn_counts(items: Any) -> tuple[int, int, bool]:
+    turn: list[dict[str, Any]] = []
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message" and item.get("role") == "user":
+                turn = []
+            else:
+                turn.append(item)
+    calls = sum(1 for item in turn if item.get("type") == "function_call")
+    texts = sum(1 for item in turn if item.get("type") == "message" and item.get("role") == "assistant")
+    return calls, texts, bool(turn) and turn[-1].get("type") == "reasoning"
+
+
+def brings_tool_results(body: dict[str, Any]) -> bool:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages or not isinstance(messages[-1], dict):
+        return False
+    if messages[-1].get("role") == "tool":
+        return True
+    return (
+        messages[-1].get("role") == "user"
+        and len(messages) > 1
+        and isinstance(messages[-2], dict)
+        and messages[-2].get("role") == "tool"
+    )
+
+
+def drop_skeleton_rounds_without_reasoning(items: list[Any]) -> list[Any]:
+    kept: list[Any] = []
+    region: list[Any] = []
+    dropped = False
+
+    def close_region() -> None:
+        nonlocal dropped
+        has_reasoning = any(isinstance(item, dict) and item.get("type") == "reasoning" for item in region)
+        for item in region:
+            if not has_reasoning and isinstance(item, dict) and item.get(TOOL_ROUND_SKELETON_KEY):
+                dropped = True
+                continue
+            kept.append(item)
+        region.clear()
+
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user":
+            close_region()
+            kept.append(item)
+        else:
+            region.append(item)
+    close_region()
+    return kept if dropped else items
 
 
 def _stable_crockford_id(seed: str, *, length: int = ULID_LENGTH) -> str:

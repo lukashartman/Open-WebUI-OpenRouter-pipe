@@ -1,0 +1,756 @@
+"""A continued answer must be stored with each earlier item exactly once, on every Open WebUI the pipe supports.
+
+Open WebUI stores what it folds together from the pipe's events, not what the pipe publishes, so these tests fold the
+published `response.completed` output the way Open WebUI's middleware does and check the stored array:
+
+- A continued turn (the request carries `assistant_message_id`) sets the message's stored output aside as
+  `prior_output`, lets `response.completed` replace `output`, and saves `prior_output + output`. Open WebUI keeps
+  the stored items itself, so the pipe must not republish them.
+- A tool-loop re-call sets everything accumulated so far aside (`full_output()`), streams the re-call into a fresh
+  `output`, and puts the set-aside items back in front. Such a re-call carries no `assistant_message_id`, because
+  the frontend sends that only when continuing, so this is the path on which the pipe still reads the stored output.
+
+Open WebUI re-calls the pipe inside one turn only when it runs the tools itself (Open-WebUI tool mode), handing the
+round's results back as tool messages that the stored output does not hold yet. A Pipeline turn's persisted tool
+results also arrive without being in the stored output, replayed from the pipe's own rows, and are not a re-call.
+"""
+
+from __future__ import annotations
+
+import __future__
+import ast
+import copy
+import importlib.metadata
+import json
+import os
+import re
+import subprocess
+import sys
+import sysconfig
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+import open_webui_openrouter_pipe.streaming.streaming_core as streaming_core_mod
+from open_webui_openrouter_pipe import Pipe, ResponsesBody, generate_item_id
+from open_webui_openrouter_pipe.requests.transformer import transform_messages_to_input
+from tests.test_reasoning_native_items import _events_of, _install_clock, _make_timed_stream
+
+STORED = [
+    {"type": "function_call", "id": "fc-old", "call_id": "old-1", "name": "lookup", "arguments": "{}",
+     "status": "completed"},
+    {"type": "function_call_output", "id": "fco-old", "call_id": "old-1",
+     "output": [{"type": "input_text", "text": "x"}], "status": "completed"},
+    {"type": "message", "id": "msg-old", "role": "assistant", "status": "completed",
+     "content": [{"type": "output_text", "text": "Part one."}]},
+]
+STORED_IDS = ["fc-old", "fco-old", "msg-old"]
+
+
+async def _approval_drain(*_args, **_kwargs):
+    return False
+
+
+def _select_open_webui(monkeypatch, *, stored: list[dict[str, Any]]) -> None:
+    class _Chats:
+        @staticmethod
+        async def get_message_by_id_and_message_id(_chat_id, _message_id):
+            return {"output": copy.deepcopy(stored)}
+
+    monkeypatch.setattr(streaming_core_mod, "Chats", _Chats)
+
+
+def _select_open_webui_saving_mid_stream(monkeypatch, *, stored_before, saved_at_first_delta):
+    """With ENABLE_REALTIME_CHAT_SAVE, Open WebUI writes the output it holds to the database on every content
+    delta, so from this call's first delta the stored output is whatever that save wrote. Returns the event hook that
+    sees the delta."""
+    state = {"stored": stored_before}
+
+    class _Chats:
+        @staticmethod
+        async def get_message_by_id_and_message_id(_chat_id, _message_id):
+            return {"output": copy.deepcopy(state["stored"])}
+
+    monkeypatch.setattr(streaming_core_mod, "Chats", _Chats)
+    monkeypatch.setattr(streaming_core_mod, "drain_approved_tool_calls", None, raising=False)
+
+    def on_event(event):
+        if event.get("type") == "chat:message:delta":
+            state["stored"] = saved_at_first_delta
+
+    return on_event
+
+
+def _user(text: str) -> dict[str, Any]:
+    return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+
+
+def _assistant(text: str) -> dict[str, Any]:
+    return {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
+
+
+def _answer_steps(text: str) -> list[tuple[float, dict[str, Any]]]:
+    return [
+        (0.0, {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-1"}}),
+        (1.0, {"type": "response.reasoning_text.delta", "item_id": "rs-1", "delta": "Thinking. "}),
+        (0.2, {"type": "response.output_text.delta", "delta": text}),
+        (0.0, {"type": "response.completed", "response": {"output": [], "usage": {}}}),
+    ]
+
+
+def _text_first_answer_steps(text: str) -> list[tuple[float, dict[str, Any]]]:
+    return [
+        (0.0, {"type": "response.output_text.delta", "delta": text}),
+        (0.2, {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-2"}}),
+        (1.0, {"type": "response.reasoning_text.delta", "item_id": "rs-2", "delta": "Thinking. "}),
+        (0.0, {"type": "response.completed", "response": {"output": [], "usage": {}}}),
+    ]
+
+
+_PARTIAL_SAVED = {"type": "message", "id": "msg-partial", "role": "assistant", "status": "in_progress",
+                  "content": [{"type": "output_text", "text": "Part two"}]}
+
+
+async def _published(
+    pipe, monkeypatch, *, continued: bool, steps, body_input, open_webui_runs_tools=False, on_event=None
+):
+    clock = _install_clock(monkeypatch)
+    monkeypatch.setattr(Pipe, "send_openrouter_streaming_request", _make_timed_stream(steps, clock))
+    emitted: list[dict[str, Any]] = []
+
+    async def emitter(event):
+        emitted.append(event)
+        if on_event is not None:
+            on_event(event)
+
+    metadata: dict[str, Any] = {"model": {"id": "test"}, "chat_id": "c-1", "message_id": "m-1"}
+    if continued:
+        metadata["assistant_message_id"] = "m-1"
+    valves = pipe.valves.model_copy(
+        update={
+            "THINKING_OUTPUT_MODE": "open_webui",
+            "TOOL_EXECUTION_MODE": "Open-WebUI" if open_webui_runs_tools else "Pipeline",
+        }
+    )
+    await pipe._streaming_handler._run_streaming_loop(
+        ResponsesBody(model="test/model", input=body_input, stream=True),
+        valves,
+        emitter,
+        metadata=metadata,
+        tools={},
+        session=cast(Any, object()),
+        user_id="user-123",
+    )
+    completions = _events_of(emitted, "response.completed")
+    assert completions, "the turn published no terminal output"
+    return (completions[-1].get("response") or {}).get("output") or []
+
+
+def _stored_after_one_call(existing, published, *, continued: bool):
+    if continued:
+        prior_output, output = list(existing), []
+    else:
+        prior_output, output = [], list(existing)
+    output = published or output
+    return prior_output + output
+
+
+def _stored_after_a_tool_round(existing, first_published, tool_results, second_published):
+    prior_output, output = list(existing), []
+    output = (first_published or output) + tool_results
+    return prior_output + output + (second_published or [])
+
+
+def _texts(items) -> list[str]:
+    return [
+        str(part.get("text"))
+        for item in items
+        if item.get("type") == "message"
+        for part in item.get("content") or []
+        if isinstance(part, dict)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("continued", [True, False], ids=["continue", "no-continue"])
+async def test_the_stored_turn_holds_each_earlier_item_exactly_once(monkeypatch, pipe_instance_async, continued):
+    _select_open_webui(monkeypatch, stored=STORED)
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=continued, steps=_answer_steps("Part two."),
+        body_input=[_user("hi"), _assistant("Part one.")],
+    )
+
+    stored = _stored_after_one_call(STORED, published, continued=continued)
+    ids = [item.get("id") for item in stored]
+
+    assert sorted(i for i in ids if i in STORED_IDS) == sorted(STORED_IDS), ids
+    assert len(ids) == len(set(ids)), ids
+    assert "Part two." in "".join(_texts(stored))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_tool_round", [False, True], ids=["answer-only", "after-a-stored-tool-round"])
+async def test_an_open_webui_tool_round_inside_a_continued_turn_stores_the_earlier_answer_once(
+    monkeypatch, pipe_instance_async, stored_tool_round
+):
+    stored_answer = list(STORED) if stored_tool_round else [STORED[2]]
+    stored_ids = [item["id"] for item in stored_answer]
+    _select_open_webui(monkeypatch, stored=stored_answer)
+    history = [_user("hi")]
+    if stored_tool_round:
+        history += [
+            {"type": "function_call", "call_id": "old-1", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old-1", "output": "x"},
+        ]
+    history.append(_assistant("Part one."))
+    call = {"type": "function_call", "id": "fc_A", "call_id": "call_A", "name": "lookup", "arguments": "{}",
+            "status": "completed"}
+    first = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=[
+            (0.0, {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-1"}}),
+            (1.0, {"type": "response.reasoning_text.delta", "item_id": "rs-1", "delta": "Thinking. "}),
+            (0.2, {"type": "response.output_item.done", "item": call}),
+            (0.0, {"type": "response.completed", "response": {"output": [call], "usage": {}}}),
+        ],
+        body_input=history,
+    )
+    result = {"type": "function_call_output", "id": "fco_A", "call_id": "call_A",
+              "output": [{"type": "input_text", "text": "ok"}], "status": "completed"}
+    second = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=_answer_steps("Part two."),
+        body_input=history + [
+            {"type": "function_call", "call_id": "call_A", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "ok"},
+        ],
+    )
+
+    stored = _stored_after_a_tool_round(stored_answer, first, [result], second)
+    ids = [item.get("id") for item in stored]
+
+    assert sorted(i for i in ids if i in stored_ids) == sorted(stored_ids), ids
+    assert _texts(stored).count("Part one.") == 1, _texts(stored)
+    assert "Part two." in "".join(_texts(stored))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_id", ["call_B", "old-1"], ids=["a-fresh-call-id", "a-call-id-the-stored-round-already-used"]
+)
+async def test_a_tool_round_that_reuses_a_stored_call_id_still_stores_the_continued_answer_once(
+    monkeypatch, pipe_instance_async, call_id
+):
+    """A re-call is recognised by how many results it brings, not by whether their ids are new.
+
+    Tool call ids repeat: both chat-completions adapters mint `toolcall-{model}-{index}` whenever the
+    provider sends a tool-call delta without one, so the first call of every request over that transport
+    carries the same id, and the transformer already documents that they are not unique across turns.
+    Deciding "Open WebUI is already holding this round" by asking whether the turn's ids appear in the
+    stored output therefore answers yes for a round Open WebUI has only just run, and the pipe republishes
+    the stored answer that Open WebUI then puts back in front itself.
+
+    The two arms differ only in the id, so a gate that counts results passes both and a gate that tests
+    membership passes only the first.
+    """
+    _select_open_webui(monkeypatch, stored=STORED)
+    history = [
+        _user("hi"),
+        {"type": "function_call", "call_id": "old-1", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "old-1", "output": "x"},
+        _assistant("Part one."),
+    ]
+    call = {"type": "function_call", "id": "fc_B", "call_id": call_id, "name": "lookup", "arguments": "{}",
+            "status": "completed"}
+    first = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=[
+            (0.0, {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-B"}}),
+            (1.0, {"type": "response.reasoning_text.delta", "item_id": "rs-B", "delta": "Thinking. "}),
+            (0.2, {"type": "response.output_item.done", "item": call}),
+            (0.0, {"type": "response.completed", "response": {"output": [call], "usage": {}}}),
+        ],
+        body_input=history,
+    )
+    result = {"type": "function_call_output", "id": "fco_B", "call_id": call_id,
+              "output": [{"type": "input_text", "text": "ok"}], "status": "completed"}
+    second = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=_answer_steps("Part two."),
+        body_input=history + [
+            {"type": "function_call", "call_id": call_id, "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": call_id, "output": "ok"},
+        ],
+    )
+
+    stored = _stored_after_a_tool_round(STORED, first, [result], second)
+
+    assert _texts(stored).count("Part one.") == 1, _texts(stored)
+    assert "Part two." in "".join(_texts(stored))
+
+
+@pytest.mark.asyncio
+async def test_tool_results_from_an_earlier_turn_are_not_taken_for_a_re_call(monkeypatch, pipe_instance_async):
+    """Only the continued turn's own tool results can show that Open WebUI is holding a round in memory; an earlier
+    turn's results live in that turn's message, never in this one's stored output."""
+    stored_answer = [STORED[2]]
+    _select_open_webui(monkeypatch, stored=stored_answer)
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=_answer_steps("Part two."),
+        body_input=[
+            _user("earlier question"),
+            {"type": "function_call", "call_id": "call-earlier", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-earlier", "output": "earlier result"},
+            _assistant("Earlier answer."),
+            _user("hi"),
+            _assistant("Part one."),
+        ],
+    )
+
+    stored = _stored_after_one_call(stored_answer, published, continued=True)
+
+    assert _texts(stored).count("Part one.") == 1, _texts(stored)
+    assert "Part two." in "".join(_texts(stored))
+
+
+@pytest.mark.asyncio
+async def test_a_question_typed_after_a_tool_ended_turn_still_starts_a_new_turn(monkeypatch, pipe_instance_async):
+    """A person's message is not Open WebUI's "here are the images" message, even in the same position.
+
+    Both sit straight after a tool result, so the rule that keeps Open WebUI's out of the turn scan has to be
+    narrow enough to let a real question through. What separates them is what comes next: Open WebUI writes its
+    message out when it reaches the next round's call, while a person's question is followed by whatever the
+    model said before calling anything.
+
+    Taking the earlier turn's round into this turn makes the turn look like it brought a result the stored
+    output cannot account for, so the pipe treats a re-call as new work and drops the answer it should have
+    republished. This runs on the re-call path, because a Continue leaves the stored output to Open WebUI and
+    never reaches the scan.
+    """
+    stored_answer = [
+        {"type": "function_call", "id": "fc-now", "call_id": "call-now", "name": "lookup", "arguments": "{}",
+         "status": "completed"},
+        {"type": "function_call_output", "id": "fco-now", "call_id": "call-now",
+         "output": [{"type": "input_text", "text": "this turn"}], "status": "completed"},
+        dict(STORED[2]),
+    ]
+    _select_open_webui(monkeypatch, stored=stored_answer)
+
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=False, open_webui_runs_tools=True,
+        steps=_answer_steps("Part two."),
+        body_input=[
+            _user("earlier question"),
+            {"type": "function_call", "call_id": "call-earlier", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-earlier", "output": "earlier result"},
+            _user("hi"),
+            _assistant("Part one."),
+            {"type": "function_call", "call_id": "call-now", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-now", "output": "this turn"},
+        ],
+    )
+
+    assert _texts(published).count("Part one.") == 1, (
+        "the earlier turn's result was counted into this turn, so the re-call looked like new work and the "
+        f"stored answer was not republished: {_texts(published)}"
+    )
+    assert "Part two." in "".join(_texts(published))
+
+
+@pytest.mark.asyncio
+async def test_a_mid_stream_save_does_not_make_a_tool_loop_re_call_publish_the_earlier_answer_again(
+    monkeypatch, pipe_instance_async
+):
+    # With realtime chat save, the re-call's first delta saves everything Open WebUI holds, the round's tool
+    # result included; whether to republish must rest on the stored output as it was before this call streamed.
+    stored_answer = [STORED[2]]
+    history = [_user("hi"), _assistant("Part one.")]
+    _select_open_webui(monkeypatch, stored=stored_answer)
+    call = {"type": "function_call", "id": "fc_A", "call_id": "call_A", "name": "lookup", "arguments": "{}",
+            "status": "completed"}
+    first = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=[
+            (0.0, {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-1"}}),
+            (1.0, {"type": "response.reasoning_text.delta", "item_id": "rs-1", "delta": "Thinking. "}),
+            (0.2, {"type": "response.output_item.done", "item": call}),
+            (0.0, {"type": "response.completed", "response": {"output": [call], "usage": {}}}),
+        ],
+        body_input=history,
+    )
+    result = {"type": "function_call_output", "id": "fco_A", "call_id": "call_A",
+              "output": [{"type": "input_text", "text": "ok"}], "status": "completed"}
+    on_event = _select_open_webui_saving_mid_stream(
+        monkeypatch, stored_before=stored_answer, saved_at_first_delta=(first or stored_answer) + [result, _PARTIAL_SAVED]
+    )
+    second = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=_text_first_answer_steps("Part two."),
+        body_input=history + [
+            {"type": "function_call", "call_id": "call_A", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "ok"},
+        ],
+        on_event=on_event,
+    )
+
+    stored = _stored_after_a_tool_round(stored_answer, first, [result], second)
+
+    assert _texts(stored).count("Part one.") == 1, _texts(stored)
+    assert "Part two." in "".join(_texts(stored))
+
+
+@pytest.mark.asyncio
+async def test_a_mid_stream_save_is_not_published_again_by_the_continue_that_made_it(monkeypatch, pipe_instance_async):
+    # With realtime chat save, a Continue's own first delta writes its partial answer into the stored output;
+    # read after that, the stored output would carry this call's own item back into what it publishes.
+    on_event = _select_open_webui_saving_mid_stream(
+        monkeypatch, stored_before=STORED, saved_at_first_delta=[*STORED, _PARTIAL_SAVED]
+    )
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=True, steps=_text_first_answer_steps("Part two."),
+        body_input=[_user("hi"), _assistant("Part one.")], on_event=on_event,
+    )
+
+    stored = _stored_after_one_call(STORED, published, continued=True)
+    ids = [item.get("id") for item in stored]
+
+    assert "msg-partial" not in ids, ids
+    assert sorted(i for i in ids if i in STORED_IDS) == sorted(STORED_IDS), ids
+    assert "Part two." in "".join(_texts(stored))
+
+
+def _open_webui_convert_output_to_messages():
+    """Open WebUI's own `convert_output_to_messages`, compiled from the installed source with the helpers it calls.
+
+    Importing `open_webui.utils.misc` pulls in Open WebUI's configuration, so only these functions are compiled, in a
+    namespace of their own; nothing is added to `sys.modules`.
+    """
+    source = Path(sysconfig.get_paths()["purelib"]) / "open_webui" / "utils" / "misc.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    wanted = {"convert_output_to_messages", "reconcile_tool_pairs", "get_content_from_message", "get_output_text"}
+    nodes: list[ast.stmt] = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    assert sorted(node.name for node in nodes if isinstance(node, ast.FunctionDef)) == sorted(wanted)
+    namespace: dict[str, Any] = {"json": json}
+    code = compile(
+        ast.Module(body=nodes, type_ignores=[]),
+        str(source),
+        "exec",
+        flags=__future__.annotations.compiler_flag,
+        dont_inherit=True,
+    )
+    exec(code, namespace)
+    return namespace["convert_output_to_messages"]
+
+
+_ONE_PIXEL_PNG = (
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+async def _request_input(pipe, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return await transform_messages_to_input(
+        pipe, messages, chat_id="c-1", openwebui_model_id="test", model_id="test/model", valves=pipe.valves
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", ["text", "image"])
+async def test_a_tool_round_that_returns_an_image_stores_the_continued_answer_once(
+    monkeypatch, pipe_instance_async, result
+):
+    """For its re-call Open WebUI rebuilds the round with its own converter, which moves a tool result's images into
+    a user message after the tool messages. That message belongs to the round; it does not start a new turn."""
+    pipe = pipe_instance_async
+    convert_output_to_messages = _open_webui_convert_output_to_messages()
+    stored_answer = [STORED[2]]
+    history = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Part one."}]
+    _select_open_webui(monkeypatch, stored=stored_answer)
+    call = {"type": "function_call", "id": "fc_A", "call_id": "call_A", "name": "lookup", "arguments": "{}",
+            "status": "completed"}
+    first = await _published(
+        pipe, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=[
+            (0.0, {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-1"}}),
+            (1.0, {"type": "response.reasoning_text.delta", "item_id": "rs-1", "delta": "Thinking. "}),
+            (0.2, {"type": "response.output_item.done", "item": call}),
+            (0.0, {"type": "response.completed", "response": {"output": [call], "usage": {}}}),
+        ],
+        body_input=await _request_input(pipe, history),
+    )
+    parts: list[dict[str, Any]] = [{"type": "input_text", "text": "ok"}]
+    if result == "image":
+        parts.append({"type": "input_image", "image_url": _ONE_PIXEL_PNG})
+    # After the stream Open WebUI appends its own call item for each streamed tool call, then each result. The call
+    # starts in_progress and is settled to the result's status once the tool has run, so what is stored -- and what
+    # the re-call is rebuilt from -- carries the finished status. The converter drops a pair whose call is not
+    # finished, so a round written as still running is a shape Open WebUI never stores and never replays.
+    round_items: list[dict[str, Any]] = [
+        {"type": "function_call", "id": "call_A", "call_id": "call_A", "name": "lookup", "arguments": "{}",
+         "status": "completed"},
+        {"type": "function_call_output", "id": "fco_A", "call_id": "call_A", "output": parts, "status": "completed"},
+    ]
+    # The converter replays a pair only when the call is finished, so a round written as still running is
+    # silently discarded whole. Asserted here rather than left to the converter, so that a fixture drifting
+    # back to an unfinished call fails loudly instead of quietly testing nothing.
+    assert all(
+        item["status"] in {"completed", "failed", "rejected"}
+        for item in round_items
+        if item["type"] == "function_call"
+    ), round_items
+    re_call = history + convert_output_to_messages(first + round_items, raw=True, flatten_tool_images=True)
+    assert [message["role"] for message in re_call[len(history):]] == (
+        ["assistant", "tool", "user"] if result == "image" else ["assistant", "tool"]
+    ), re_call
+    second = await _published(
+        pipe, monkeypatch, continued=True, open_webui_runs_tools=True, steps=_answer_steps("Part two."),
+        body_input=await _request_input(pipe, re_call),
+    )
+
+    stored = _stored_after_a_tool_round(stored_answer, first, round_items, second)
+
+    assert _texts(stored).count("Part one.") == 1, _texts(stored)
+    assert "Part two." in "".join(_texts(stored))
+
+
+def _owui_round(index: int, *, image: bool) -> list[dict[str, Any]]:
+    """One round as Open WebUI stores it. Every round of a turn carries the same call id, because both
+    chat-completions adapters mint `toolcall-{model}-{index}` per response rather than per turn."""
+    parts: list[dict[str, Any]] = [{"type": "input_text", "text": "ok"}]
+    if image:
+        parts.append({"type": "input_image", "image_url": _ONE_PIXEL_PNG})
+    return [
+        {"type": "function_call", "id": f"fc-{index}", "call_id": "toolcall-m-0", "name": "lookup",
+         "arguments": "{}", "status": "completed"},
+        {"type": "function_call_output", "id": f"fco-{index}", "call_id": "toolcall-m-0", "output": parts,
+         "status": "completed"},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_on", [1, 2], ids=["image-on-the-first-round", "image-on-the-last-round"])
+async def test_an_image_earlier_in_the_turn_does_not_hide_the_rounds_before_it(
+    monkeypatch, pipe_instance_async, image_on
+):
+    """Open WebUI's "Here are the images..." message is only sometimes the last thing in the request.
+
+    It writes that message out whenever it reaches anything that is not a call or a result, so once the
+    model says something between rounds the message lands in the middle of the re-call rather than at the
+    end. The scan that decides which results belong to this turn starts again at every user message, so one
+    in the middle throws away every round before it -- and the turn then looks like it brought fewer results
+    than Open WebUI has already stored, which is the test for re-publishing the stored answer. Open WebUI
+    puts its own copy back in front as well, and the person reads the answer twice, with its reasoning
+    replayed twice.
+
+    This is a tool-loop re-call, not a Continue: the frontend sends `assistant_message_id` only when
+    continuing, and with it set the pipe leaves the stored output to Open WebUI and never reaches this scan.
+
+    The two arms differ only in which round returns the image, so they place the same message last (where it
+    is already handled) and in the middle. Both must store the answer once.
+    """
+    pipe = pipe_instance_async
+    convert_output_to_messages = _open_webui_convert_output_to_messages()
+    # The message already ran a round of its own, under the same minted id, because the ids are numbered per
+    # response. Open WebUI holds this turn's new rounds in memory and writes them at the end, so through the
+    # whole loop the database still holds that one stored round and the answer.
+    stored_answer = _owui_round(0, image=False) + [dict(STORED[2])]
+    _select_open_webui(monkeypatch, stored=stored_answer)
+    history = [{"role": "user", "content": "hi"}] + convert_output_to_messages(
+        stored_answer, raw=True, flatten_tool_images=True
+    )
+
+    call = {"type": "function_call", "id": "fc-x", "call_id": "toolcall-m-0", "name": "lookup",
+            "arguments": "{}", "status": "completed"}
+    calling_steps = [
+        (0.0, {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs-1"}}),
+        (1.0, {"type": "response.reasoning_text.delta", "item_id": "rs-1", "delta": "Thinking. "}),
+        (0.2, {"type": "response.output_item.done", "item": call}),
+        (0.0, {"type": "response.completed", "response": {"output": [call], "usage": {}}}),
+    ]
+
+    first = await _published(
+        pipe, monkeypatch, continued=False, open_webui_runs_tools=True, steps=calling_steps,
+        body_input=await _request_input(pipe, history),
+    )
+    in_memory = first + _owui_round(1, image=image_on == 1)
+    assert _texts(first).count("Part one.") == 1, "the first call of the turn republishes the stored answer"
+
+    second = await _published(
+        pipe, monkeypatch, continued=False, open_webui_runs_tools=True, steps=calling_steps,
+        body_input=await _request_input(
+            pipe, history + convert_output_to_messages(in_memory, raw=True, flatten_tool_images=True)
+        ),
+    )
+    in_memory = in_memory + second + _owui_round(2, image=image_on == 2)
+
+    last = await _published(
+        pipe, monkeypatch, continued=False, open_webui_runs_tools=True, steps=_answer_steps("Part two."),
+        body_input=await _request_input(
+            pipe, history + convert_output_to_messages(in_memory, raw=True, flatten_tool_images=True)
+        ),
+    )
+    stored = in_memory + last
+
+    assert _texts(stored).count("Part one.") == 1, _texts(stored)
+    assert "Part two." in "".join(_texts(stored))
+
+
+@pytest.mark.asyncio
+async def test_a_continue_after_a_turn_that_ended_on_a_tool_result_keeps_its_stored_answer(
+    monkeypatch, pipe_instance_async
+):
+    """A user message straight after a tool result starts a new turn whenever anything follows it in the request."""
+    stored_answer = [STORED[2]]
+    _select_open_webui(monkeypatch, stored=stored_answer)
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=True, open_webui_runs_tools=True,
+        steps=_answer_steps("Part two."),
+        body_input=[
+            _user("earlier question"),
+            {"type": "function_call", "call_id": "call-earlier", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-earlier", "output": "earlier result"},
+            _user("hi"),
+            _assistant("Part one."),
+        ],
+    )
+
+    stored = _stored_after_one_call(stored_answer, published, continued=True)
+
+    assert _texts(stored).count("Part one.") == 1, _texts(stored)
+    assert "Part two." in "".join(_texts(stored))
+
+
+async def _pipeline_generation_with_a_persisted_tool_round(pipe, monkeypatch, persisted: dict[str, dict]):
+    """The message's first generation: the pipe runs one tool round with results persisted and tool cards off.
+
+    Returns what Open WebUI stores for this fresh turn and the content, which carries the hidden markers.
+    """
+    rounds = iter([
+        [
+            {"type": "response.output_item.done", "item": {
+                "id": "rs-a", "type": "reasoning", "status": "completed",
+                "content": [{"type": "reasoning_text", "text": "Looking it up."}], "summary": [], "signature": "SIG-A"}},
+            {"type": "response.output_item.done", "item": {
+                "type": "function_call", "call_id": "call-X", "name": "lookup", "arguments": "{}",
+                "status": "completed"}},
+            {"type": "response.completed", "response": {"output": [
+                {"type": "function_call", "call_id": "call-X", "name": "lookup", "arguments": "{}"}], "usage": {}}},
+        ],
+        [
+            {"type": "response.output_item.done", "item": {
+                "id": "rs-b", "type": "reasoning", "status": "completed",
+                "content": [{"type": "reasoning_text", "text": "Answering."}], "summary": [], "signature": "SIG-B"}},
+            {"type": "response.output_text.delta", "delta": "Part one."},
+            {"type": "response.completed", "response": {"output": [], "usage": {}}},
+        ],
+    ])
+
+    async def streaming(self, session, request_body, **_kwargs):
+        for event in next(rounds):
+            yield event
+
+    async def run_tools(calls, _registry):
+        return [
+            {"type": "function_call_output", "call_id": call.get("call_id"), "output": "lookup result",
+             "status": "completed"}
+            for call in calls
+        ]
+
+    async def persist(rows):
+        ulids = [generate_item_id() for _ in rows]
+        persisted.update(zip(ulids, (row["payload"] for row in rows)))
+        return ulids
+
+    monkeypatch.setattr(Pipe, "send_openrouter_streaming_request", streaming)
+    monkeypatch.setattr(pipe._ensure_tool_executor(), "_execute_function_calls", run_tools)
+    monkeypatch.setattr(pipe._artifact_store, "_make_db_row", lambda _c, _m, _model, payload: {"payload": payload})
+    monkeypatch.setattr(pipe._artifact_store, "_db_persist", persist)
+    emitted: list[dict[str, Any]] = []
+
+    async def emitter(event):
+        emitted.append(event)
+
+    valves = pipe.valves.model_copy(
+        update={
+            "THINKING_OUTPUT_MODE": "open_webui",
+            "TOOL_EXECUTION_MODE": "Pipeline",
+            "PERSIST_TOOL_RESULTS": True,
+            "SHOW_TOOL_CARDS": False,
+            "PERSIST_REASONING_TOKENS": "conversation",
+            "MAX_FUNCTION_CALL_LOOPS": 3,
+        }
+    )
+    content = await pipe._streaming_handler._run_streaming_loop(
+        ResponsesBody(model="test/model", input=[_user("hi")], stream=True),
+        valves,
+        emitter,
+        metadata={"model": {"id": "test"}, "chat_id": "c-1", "message_id": "m-1"},
+        tools={"lookup": {"callable": lambda **_kwargs: "lookup result"}},
+        session=cast(Any, object()),
+        user_id="user-123",
+    )
+    completions = _events_of(emitted, "response.completed")
+    assert completions, "the first generation published no terminal output"
+    return (completions[-1].get("response") or {}).get("output") or [], content
+
+
+@pytest.mark.asyncio
+async def test_a_continue_keeps_the_stored_answer_when_the_pipes_own_tool_results_replay_into_the_request(
+    monkeypatch, pipe_instance_async
+):
+    """A Continue replaces the stored output with what the pipe publishes, so the pipe must still
+    publish the stored answer when the request carries tool results the stored output lacks because they came back
+    from the pipe's own rows rather than from an Open WebUI tool round."""
+    pipe = pipe_instance_async
+    persisted: dict[str, dict] = {}
+    _select_open_webui(monkeypatch, stored=[])
+    stored, content = await _pipeline_generation_with_a_persisted_tool_round(pipe, monkeypatch, persisted)
+
+    async def loader(_chat_id, _message_id, ulids):
+        return {ulid: persisted[ulid] for ulid in ulids if ulid in persisted}
+
+    continue_input = await transform_messages_to_input(
+        pipe,
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "message_id": "m-1", "content": content}],
+        chat_id="c-1",
+        openwebui_model_id="test",
+        artifact_loader=loader,
+        model_id="test/model",
+        valves=pipe.valves,
+    )
+    assert not [item for item in stored if item.get("type") in ("function_call", "function_call_output")], stored
+    assert "call-X" in {
+        item.get("call_id") for item in continue_input if item.get("type") == "function_call_output"
+    }, continue_input
+
+    _select_open_webui(monkeypatch, stored=stored)
+    published = await _published(
+        pipe, monkeypatch, continued=True, steps=_answer_steps("Part two."), body_input=continue_input
+    )
+
+    after = _stored_after_one_call(stored, published, continued=True)
+    stored_ids = [item.get("id") for item in stored]
+    after_ids = [item.get("id") for item in after]
+    assert sorted(i for i in after_ids if i in stored_ids) == sorted(stored_ids), after_ids
+    assert len(after_ids) == len(set(after_ids)), after_ids
+    assert "".join(_texts(after)).count("Part one.") == 1, _texts(after)
+    assert "Part two." in "".join(_texts(after))
+
+
+@pytest.mark.asyncio
+async def test_a_continued_turn_leaves_a_stranded_call_as_open_webui_stored_it(monkeypatch, pipe_instance_async):
+    # A Stop during a tool call leaves the call in_progress. Open WebUI keeps the stored items itself on a
+    # continue, so the pipe republishes none of them and the call stays exactly as stored: parity with Open WebUI,
+    # chosen over a repair that events cannot make without duplicating the item.
+    stranded = [dict(STORED[0], status="in_progress"), STORED[1], STORED[2]]
+    _select_open_webui(monkeypatch, stored=stranded)
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=True, steps=_answer_steps("Part two."),
+        body_input=[_user("hi"), _assistant("Part one.")],
+    )
+
+    stored = _stored_after_one_call(stranded, published, continued=True)
+
+    assert not {item.get("id") for item in published} & set(STORED_IDS)
+    assert [item.get("status") for item in stored if item.get("id") == "fc-old"] == ["in_progress"]

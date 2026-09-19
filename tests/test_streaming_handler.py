@@ -3189,7 +3189,7 @@ class TestPersistReasoning:
         body._replayed_reasoning_refs = ["ulid-1", "ulid-2"]  # type: ignore
 
         deleted_refs: list[str] = []
-        async def mock_delete(refs):
+        async def mock_delete(refs, keep_message_id=None):
             deleted_refs.extend(refs)
 
         monkeypatch.setattr(pipe._artifact_store, "_delete_artifacts", mock_delete)
@@ -3209,7 +3209,7 @@ class TestPersistReasoning:
         body._replayed_reasoning_refs = ["ulid-1"]  # type: ignore
 
         deleted_refs: list[str] = []
-        async def mock_delete(refs):
+        async def mock_delete(refs, keep_message_id=None):
             deleted_refs.extend(refs)
 
         monkeypatch.setattr(pipe._artifact_store, "_delete_artifacts", mock_delete)

@@ -267,11 +267,12 @@ class ArtifactStore:
         )
         self._breaker_threshold = self.valves.BREAKER_MAX_FAILURES
         self._breaker_window_seconds = self.valves.BREAKER_WINDOW_SECONDS
+        self._db_breaker_maxlen = breaker_history_size
         self._db_breakers: dict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=breaker_history_size)
         )
 
-    def configure_breaker(self, threshold: int, window_seconds: int) -> None:
+    def configure_breaker(self, threshold: int, window_seconds: int, history_size: int | None = None) -> None:
         """Update circuit breaker thresholds.
 
         Args:
@@ -280,6 +281,13 @@ class ArtifactStore:
         """
         self._breaker_threshold = threshold
         self._breaker_window_seconds = window_seconds
+        maxlen = max(threshold, self._db_breaker_maxlen if history_size is None else history_size)
+        if maxlen != self._db_breaker_maxlen:
+            self._db_breaker_maxlen = maxlen
+            self._db_breakers = defaultdict(
+                lambda: deque(maxlen=maxlen),
+                {user_id: deque(window, maxlen=maxlen) for user_id, window in self._db_breakers.items()},
+            )
 
     def _initialize_redis_state(self):
         """Initialize Redis caching state."""
@@ -1069,7 +1077,9 @@ class ArtifactStore:
         try:
             self._prepare_rows_for_storage(rows)
             if self._redis_enabled:
-                return await self._redis_enqueue_rows(rows)
+                queued = await self._redis_enqueue_rows(rows)
+                self._reset_db_failure(user_id)
+                return queued
             return await self._db_persist_direct(rows, user_id=user_id)
         except Exception:
             self._record_db_failure(user_id)
@@ -1302,30 +1312,54 @@ class ArtifactStore:
         return {}
 
     @timed
-    def _delete_artifacts_sync(self, artifact_ids: list[str]) -> None:
+    def _delete_artifacts_sync(self, artifact_ids: list[str], keep_message_id: str | None = None) -> set[str]:
         """Synchronously delete artifacts by ULID."""
         if not (artifact_ids and self._session_factory and self._item_model):
-            return
+            return set()
+        model = self._item_model
+        kept: set[str] = set()
         with _db_session(self._session_factory) as session:
-            (
-                session.query(self._item_model)
-                .filter(self._item_model.id.in_(artifact_ids))
-                .delete(synchronize_session=False)
-            )
+            query = session.query(model).filter(model.id.in_(artifact_ids))
+            if keep_message_id:
+                kept = {
+                    row_id
+                    for (row_id,) in query.filter(model.message_id == keep_message_id).with_entities(model.id)
+                }
+                query = query.filter(model.message_id != keep_message_id)
+            query.delete(synchronize_session=False)
             session.commit()
+        return kept
 
     @timed
-    async def _delete_artifacts(self, refs: list[tuple[str, str]]) -> None:
+    async def _delete_artifacts(self, refs: list[tuple[str, str]], keep_message_id: str | None = None) -> None:
         """Delete persisted artifacts (and cached copies) once they have been replayed."""
         if not refs:
             return
         ids = sorted({artifact_id for _, artifact_id in refs if artifact_id})
         if not ids or not self._db_executor:
             return
+        owners = await self._redis_cached_owners(refs)
+        dropped_while_queued = [row_id for row_id, owner in owners.items() if owner != keep_message_id]
+        if dropped_while_queued and self._redis_client:
+            try:
+                pipe = self._redis_client.pipeline()
+                for row_id in dropped_while_queued:
+                    pipe.setex(self._redis_deleted_key(row_id), self._redis_ttl, "1")
+                await _await_if_needed(pipe.execute())
+            except Exception as exc:
+                self.logger.warning("Redis delete marker write failed (best-effort): %s", exc, exc_info=True)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._db_executor, functools.partial(self._delete_artifacts_sync, ids))
+        kept = await loop.run_in_executor(
+            self._db_executor, functools.partial(self._delete_artifacts_sync, ids, keep_message_id)
+        )
+        if keep_message_id:
+            kept = kept | {row_id for row_id, owner in owners.items() if owner == keep_message_id}
         if self._redis_enabled and self._redis_client:
-            keys = [self._redis_cache_key(chat_id, artifact_id) for chat_id, artifact_id in refs]
+            keys = [
+                self._redis_cache_key(chat_id, artifact_id)
+                for chat_id, artifact_id in refs
+                if artifact_id not in kept
+            ]
             keys = [key for key in keys if key]
             if keys:
                 try:
@@ -1550,6 +1584,8 @@ class ArtifactStore:
             except Exception as exc:
                 failure = f"{type(exc).__name__}: {exc}"
                 self.logger.exception("❌ DB flush failed! %d artifacts could not be persisted", len(rows))
+            if committed:
+                await self._drop_rows_deleted_while_queued(sorted(committed))
 
             unrecoverable = [row for _entry, row in entries_by_row if row.get("payload") is None]
             uncommitted = [
@@ -1623,6 +1659,54 @@ class ArtifactStore:
         if not (chat_id and row_id):
             return None
         return f"{self._redis_cache_prefix}:{chat_id}:{row_id}"
+
+    def _redis_deleted_key(self, row_id: str) -> str:
+        return f"{self._redis_namespace}:deleted:{row_id}"
+
+    @timed
+    async def _redis_cached_owners(self, refs: list[tuple[str, str]]) -> dict[str, Any]:
+        if not (self._redis_enabled and self._redis_client):
+            return {}
+        keys: list[str] = []
+        row_ids: list[str] = []
+        for chat_id, row_id in refs:
+            cache_key = self._redis_cache_key(chat_id, row_id)
+            if cache_key:
+                keys.append(cache_key)
+                row_ids.append(row_id)
+        if not keys:
+            return {}
+        try:
+            values = await _await_if_needed(self._redis_client.mget(keys))
+        except Exception as exc:
+            self.logger.warning("Redis read of cached artifact owners failed (best-effort): %s", exc, exc_info=True)
+            return {}
+        owners: dict[str, Any] = {}
+        for row_id, raw in zip(row_ids, values or []):
+            if not raw:
+                continue
+            try:
+                row = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(row, dict) and row.get("message_id"):
+                owners[row_id] = row["message_id"]
+        return owners
+
+    @timed
+    async def _drop_rows_deleted_while_queued(self, row_ids: list[str]) -> None:
+        if not (self._redis_client and self._db_executor):
+            return
+        try:
+            markers = await _await_if_needed(
+                self._redis_client.mget([self._redis_deleted_key(row_id) for row_id in row_ids])
+            )
+            deleted = [row_id for row_id, marker in zip(row_ids, markers or []) if marker]
+            if deleted:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(self._db_executor, functools.partial(self._delete_artifacts_sync, deleted))
+        except Exception as exc:
+            self.logger.warning("Removing flushed artifacts deleted while queued failed: %s", exc, exc_info=True)
 
     @timed
     async def _redis_enqueue_rows(self, rows: list[dict[str, Any]]) -> list[str]:

@@ -32,7 +32,11 @@ from ..core.errors import (
 from ..core.fusion_defaults import find_fusion_entry, resolve_fusion_run
 from ..core.logging_system import SessionLogger
 from ..core.timing_logger import timed
-from ..core.utils import _select_best_effort_fallback
+from ..core.utils import (
+    _select_best_effort_fallback,
+    brings_tool_results,
+    continued_turn_counts,
+)
 from ..core.warn_latch import warn_level
 from ..filters.fusion_filter_renderer import is_fusion_model
 from ..integrations.image_help import render_image_help
@@ -49,7 +53,10 @@ from ..storage.owui_files import (
 )
 from ..storage.users import get_user_by_id
 from ..streaming.constants import DEFERRED_REASONING_FLUSH
-from ..tools.tool_registry import _build_collision_safe_tool_specs_and_registry
+from ..tools.tool_registry import (
+    _advertised_names_for_replayed_calls,
+    _build_collision_safe_tool_specs_and_registry,
+)
 from .fusion_engine import (
     FusionInnerInvocation,
     asks_for_help,
@@ -65,6 +72,64 @@ if TYPE_CHECKING:
 
 
 from ..models.registry import uses_dedicated_image_api
+
+
+def _resent_message_key(message: Any) -> tuple[Any, ...]:
+    if not isinstance(message, dict):
+        return (repr(message),)
+    content = message.get("content")
+    calls = tuple(
+        (call.get("id"), json.dumps(call.get("function"), sort_keys=True))
+        for call in message.get("tool_calls") or []
+        if isinstance(call, dict)
+    )
+    return (
+        message.get("role"),
+        content if isinstance(content, str) else json.dumps(content, sort_keys=True),
+        calls,
+        message.get("tool_call_id"),
+    )
+
+
+def _extends_resent_message(first: Any, repeat: Any) -> bool:
+    if not isinstance(first, dict) or not isinstance(repeat, dict):
+        return False
+    if first.get("role") != "assistant":
+        return _resent_message_key(first) == _resent_message_key(repeat)
+    first_text, repeat_text = first.get("content") or "", repeat.get("content") or ""
+    first_calls = [call.get("id") for call in first.get("tool_calls") or [] if isinstance(call, dict)]
+    repeat_calls = [call.get("id") for call in repeat.get("tool_calls") or [] if isinstance(call, dict)]
+    return (
+        repeat.get("role") == "assistant"
+        and isinstance(first_text, str)
+        and isinstance(repeat_text, str)
+        and repeat_text.startswith(first_text)
+        and repeat_calls[: len(first_calls)] == first_calls
+    )
+
+
+def _without_resent_continued_turn(messages: list[Any]) -> list[Any]:
+    if not brings_tool_results({"messages": messages}):
+        return messages
+    start = None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        after_tool = index > 0 and isinstance(messages[index - 1], dict) and messages[index - 1].get("role") == "tool"
+        if isinstance(message, dict) and message.get("role") == "user" and not after_tool:
+            start = index + 1
+            break
+    if start is None or start >= len(messages) or not isinstance(messages[start], dict):
+        return messages
+    if messages[start].get("role") != "assistant":
+        return messages
+    for size in range((len(messages) - start - 1) // 2, 0, -1):
+        first = messages[start : start + size]
+        repeat = messages[start + size : start + 2 * size]
+        if [_resent_message_key(m) for m in first[:-1]] != [_resent_message_key(m) for m in repeat[:-1]]:
+            continue
+        if _extends_resent_message(first[-1], repeat[-1]):
+            return messages[:start] + messages[start + size :]
+    return messages
 
 
 def _inject_image_modalities(
@@ -654,6 +719,8 @@ class RequestOrchestrator:
 
         _inject_image_modalities(body, logger=self.logger)
 
+        if __metadata__.get("assistant_message_id") and isinstance(body.get("messages"), list):
+            body = {**body, "messages": _without_resent_continued_turn(body["messages"])}
         completions_body = CompletionsBody.model_validate(body)
 
         vvb = virtual_variant_bases or {}
@@ -675,6 +742,7 @@ class RequestOrchestrator:
             transformer_valves=valves,
             capability_model_id=pre_capability_model_id,
         )
+        responses_body._continued_turn = continued_turn_counts(responses_body.input)
         responses_body.input_file_sizes = await index_referenced_file_payloads(
             responses_body.input, self.logger, user=user_model
         )
@@ -933,6 +1001,8 @@ class RequestOrchestrator:
                 user_obj=user_model,
                 normalized_model_id=normalized_model_id,
                 api_model_id=api_model_id,
+                outcome_sink=outcome_sink,
+                breaker_key=user_id or None,
             )
 
         model_output_modalities = (
@@ -986,6 +1056,8 @@ class RequestOrchestrator:
                     user_obj=user_model,
                     normalized_model_id=normalized_model_id,
                     api_model_id=api_model_id,
+                    outcome_sink=outcome_sink,
+                    breaker_key=user_id or None,
                 )
 
             api_model_id = OpenRouterModelRegistry.api_model_id(normalized_model_id) or normalized_model_id
@@ -1095,6 +1167,11 @@ class RequestOrchestrator:
                         if name not in owui_registry and name not in known_origins:
                             owui_registry[name] = tool_cfg
 
+        request_pipe_meta = __metadata__.get(_PIPE_METADATA_KEY) if isinstance(__metadata__, dict) else None
+        if isinstance(request_pipe_meta, dict) and request_pipe_meta.get("fusion_inner"):
+            is_builtin_ask_user = self._pipe._ensure_tool_executor()._is_builtin_ask_user
+            owui_registry = {name: cfg for name, cfg in owui_registry.items() if not is_builtin_ask_user(cfg)}
+
         tools, exec_registry, exposed_to_origin = _build_collision_safe_tool_specs_and_registry(
             request_tool_specs=incoming_tools if incoming_tools else None,
             owui_registry=owui_registry or None,
@@ -1105,6 +1182,7 @@ class RequestOrchestrator:
             owui_tool_passthrough=owui_tool_passthrough,
             logger=self.logger,
         )
+        _advertised_names_for_replayed_calls(responses_body.input, exposed_to_origin)
         if self.logger.isEnabledFor(logging.DEBUG):
             renames = [
                 (exposed, origin)
@@ -1226,7 +1304,7 @@ class RequestOrchestrator:
                 plan=plan,
             )
             if responses_body.stream:
-                return await self._pipe._streaming_handler._run_streaming_loop(
+                fusion_result = await self._pipe._streaming_handler._run_streaming_loop(
                     responses_body,
                     valves,
                     __event_emitter__,
@@ -1242,22 +1320,26 @@ class RequestOrchestrator:
                     event_source=engine_source,
                     outcome_sink=outcome_sink,
                 )
-            return await self._pipe._streaming_handler._run_nonstreaming_loop(
-                responses_body,
-                valves,
-                __event_emitter__,
-                __metadata__,
-                __tools__,
-                session=session,
-                user_id=user_id,
-                endpoint_override=endpoint_override,
-                request_context=__request__,
-                user_obj=user_model,
-                pipe_identifier=pipe_identifier,
-                fusion_live_enabled=fusion_live_enabled,
-                event_source=engine_source,
-                outcome_sink=outcome_sink,
-            )
+            else:
+                fusion_result = await self._pipe._streaming_handler._run_nonstreaming_loop(
+                    responses_body,
+                    valves,
+                    __event_emitter__,
+                    __metadata__,
+                    __tools__,
+                    session=session,
+                    user_id=user_id,
+                    endpoint_override=endpoint_override,
+                    request_context=__request__,
+                    user_obj=user_model,
+                    pipe_identifier=pipe_identifier,
+                    fusion_live_enabled=fusion_live_enabled,
+                    event_source=engine_source,
+                    outcome_sink=outcome_sink,
+                )
+            if invocation.no_usable_member and outcome_sink is not None:
+                outcome_sink["error_occurred"] = True
+            return fusion_result
 
         reasoning_retry_attempted = False
         reasoning_effort_retry_attempted = False

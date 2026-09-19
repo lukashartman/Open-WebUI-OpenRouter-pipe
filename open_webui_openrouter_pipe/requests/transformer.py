@@ -41,8 +41,10 @@ from ..core.utils import (
     REASONING_FOLLOWING_ORDINAL_KEY,
     REASONING_PRECEDING_ORDINAL_KEY,
     REASONING_TEXT_ORDINAL_KEY,
+    TOOL_ROUND_SKELETON_KEY,
     _extract_plain_text_content,
     contains_marker,
+    drop_skeleton_rounds_without_reasoning,
     split_text_by_markers,
     split_text_by_phase_markers,
     strip_hidden_marker_lines,
@@ -208,6 +210,7 @@ def _reinterleave_reasoning_by_anchor(
     a tool call within its own turn -- tool ``call_id`` values are not unique across
     turns (the chat-completions adapter assigns index-based ids that repeat).
     """
+    items = drop_skeleton_rounds_without_reasoning(items)
     out: list[dict[str, Any]] = []
     region: list[dict[str, Any]] = []
     for it in items:
@@ -1733,7 +1736,7 @@ async def transform_messages_to_input(
                         missing_artifact_markers.append(segment["marker"])
                         continue
                     if (
-                        artifact_payload.get("type") == "reasoning"
+                        (artifact_payload.get("type") == "reasoning" or artifact_payload.get(TOOL_ROUND_SKELETON_KEY))
                         and replayed_reasoning_refs is not None
                         and chat_id
                     ):
