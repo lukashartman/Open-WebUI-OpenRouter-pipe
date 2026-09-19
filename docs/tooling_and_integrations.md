@@ -25,7 +25,7 @@ The pipe runs the tool loop itself:
 - The pipe appends `function_call_output` items and re-calls the provider until the model stops requesting tools or `MAX_FUNCTION_CALL_LOOPS` is reached (at which point the model gets a synthesis turn).
 
 **You gain:**
-- Pipe-level concurrency controls, batching, retries/timeouts, and breaker protections around tool execution.
+- Pipe-level concurrency controls, batching, timeouts, and breaker protections around tool execution.
 - Optional persistence/replay of tool results via the pipe artifact store (`PERSIST_TOOL_RESULTS`, `TOOL_OUTPUT_RETENTION_TURNS`), which can reduce repeated tool calls and help with long chats.
 - Optional strictification of tool schemas (`ENABLE_STRICT_TOOL_CALLING`) for more predictable function calling.
 
@@ -45,7 +45,7 @@ The pipe does **not** execute tools. Instead, it returns tool calls in an OpenAI
 - Better compatibility with OpenRouter streaming quirks: OpenRouter `/responses` can emit tool calls with `arguments:""` early; in this mode the pipe will **never** emit `arguments:""` to Open WebUI (it waits for complete args or normalizes to `{}`).
 
 **You lose / trade off:**
-- The pipe does not run tool batching/retries/breakers; Open WebUI’s behavior governs execution.
+- The pipe does not run tool batching, tool timeouts or tool breakers; Open WebUI’s behavior governs execution. The per-user request breaker still applies.
 - Tool result persistence in the pipe artifact store is disabled (even if `PERSIST_TOOL_RESULTS=True`). Tool outputs still exist in chat history, but large tool outputs may increase context size/cost versus persistence-based replay.
 - In pass-through, the pipe does not strictify or mutate tool schemas; Open WebUI’s schemas are forwarded as-is.
 
@@ -173,36 +173,39 @@ This setting is available as both an admin valve and a user valve (users can ove
 
 Tools are executed via a per-request worker pool backed by a bounded queue:
 
-- Queue size: 50 tool calls per request (bounded).
+- Queue size: 50 batches per request (bounded).
 - Worker count: `MAX_PARALLEL_TOOLS_PER_REQUEST`.
 - Per-request semaphore: limits concurrent tool executions per request.
 - Global semaphore: `MAX_PARALLEL_TOOLS_GLOBAL` limits tool executions across all requests.
+- Open WebUI's built-in `ask_user` takes no slot from either semaphore, because it waits on a person rather than doing work.
 
 Batching behavior:
 
-- Tool calls may be batched when they share the same tool name and do not declare dependency/ordering blockers in arguments.
-- If tool arguments include any of: `depends_on`, `_depends_on`, `sequential`, `no_batch`, the call is treated as non-batchable.
-- Batching does not require identical arguments; it is a concurrency optimization, not a deduplication mechanism.
+- The pipe groups a response's tool calls into batches before any of them runs. Consecutive calls join one batch, up to `TOOL_BATCH_CAP` calls, when they share a tool name, when neither the joining call nor the batch's first call carries a dependency or ordering blocker in its arguments, and when neither of those two names the other's call ID. A call refused before queueing (an unknown tool, invalid arguments or a tripped breaker) does not break a run of consecutive calls.
+- A call whose arguments include any of `depends_on`, `_depends_on`, `sequential` or `no_batch` is never batched. These keys only keep the call out of a batch; they do not make it wait for other calls.
+- Batching does not require identical arguments and never deduplicates calls. It does not raise concurrency either: every call in a batch except `ask_user` still waits for a per-request slot and a global slot, and all calls in a batch share one batch deadline.
+- Each batch is queued separately, so while slots are free, a slow call never holds up a call to another tool, and a response's calls start together as long as there are free slots for all of them. Each call's result is handed back as soon as that call finishes, even while other calls in its batch are still running. The same holds inside internal Fusion, where each model gets as many tool workers as the chat request it answers, and all of those models share that request's slots.
 
 Timeouts:
 
-- Each tool call is run with a per-call timeout (`TOOL_TIMEOUT_SECONDS`).
-- Tool calls are executed exactly once — a raising tool is never automatically retried, because tools may have side effects (an MCP tool that sends an email must not fire twice). The failure is reported back to the model, which can decide whether to call again.
-- An MCP tool whose client connection was already closed by Open WebUI reports "no longer available in this session" instead of a raw error, and does not count against the tool's breaker.
-- Tool batches are guarded by a batch timeout (derived from `TOOL_BATCH_TIMEOUT_SECONDS` and the per-call timeout).
-- If the tool queue stays idle for `TOOL_IDLE_TIMEOUT_SECONDS`, the worker loop cancels pending work and surfaces an error.
+- Each tool call has a per-call timeout (`TOOL_TIMEOUT_SECONDS`), measured from when the call starts running, not from when it starts waiting for a slot. When it expires the pipe stops waiting, the model reads `Tool '<name>' timed out after <N>s.`, and the timeout counts toward that tool's breaker. An async tool is cancelled; a tool written as a plain function is not, and runs to its end.
+- Each tool call runs exactly once. A tool that raises an error is never retried automatically, because tools can have side effects (an MCP tool that sends an email must not fire twice). The failure is reported to the model, which can decide whether to call again.
+- If Open WebUI has already closed an MCP tool's client connection, the tool reports "no longer available in this session" rather than a raw error, and this does not count against its breaker.
+- Calls grouped into one batch share a batch deadline (`TOOL_BATCH_TIMEOUT_SECONDS`, never shorter than the per-call timeout). Its clock starts with the batch, so time spent waiting for a slot counts. When the deadline passes, finished calls keep their results; every call still running or still waiting is cancelled and reported as `Tool batch '<name>' exceeded <N>s and was cancelled.` Of the cancelled calls, only the running ones count toward the tool's breaker, except any that `TOOL_IDLE_TIMEOUT_SECONDS` had already given up on.
+- `TOOL_IDLE_TIMEOUT_SECONDS` (unset by default) caps how long the pipe waits for each result, one at a time, in call order. When that time passes, the model reads `Tool '<name>' timed out after <N>s (idle timeout).` Giving up this way does not count toward the tool's breaker. A call that is already running is not stopped: it keeps running and holds its slot until it finishes, another limit ends it, or request cleanup cancels it after `TOOL_SHUTDOWN_TIMEOUT_SECONDS`. The model never receives the late result, though files or embeds the call returns can still appear in the chat. The call's own later error or per-call timeout still counts toward the tool's breaker, and a later success clears the count. A call still waiting for a slot or a worker never starts. The tool workers remain for the whole request, except inside internal Fusion, where a model's workers and its running calls are cancelled as soon as that model's answer ends, without the `TOOL_SHUTDOWN_TIMEOUT_SECONDS` wait.
+- Open WebUI's built-in `ask_user` keeps its question open for the time the model asked for, as normalised by Open WebUI. Its per-call limit becomes that time plus 15 seconds, and the batch deadline and the idle limit are raised to at least that long. Since it takes no tool slot, its question does not wait for other requests' tools, though it still needs one of its own request's workers to be free. Its timeout does not count toward the breaker. It runs alone: an `ask_user` call mixed with other calls, or repeated in the same response, is refused with Open WebUI's error text, and the other calls run.
 
 ---
 
 ## Breakers (stability controls)
 
-The pipe applies a shared breaker window (`BREAKER_MAX_FAILURES` within `BREAKER_WINDOW_SECONDS`) across different subsystems:
+Three per-user breakers share `BREAKER_MAX_FAILURES` and `BREAKER_WINDOW_SECONDS`; each internal Fusion run also keeps one count per tool, shared by all of its models, which uses `BREAKER_MAX_FAILURES` but not the window. The per-user breakers count failures in two ways:
 
-- **Per-user request breaker:** prevents repeated failing requests from thrashing the system.
-- **Per-user, per-tool breaker:** temporarily disables executing a specific tool (keyed by tool type and tool name) for a user after repeated failures of that tool. Other tools of the same type keep working, and one flaky MCP tool no longer disables a whole server's tools.
-- **Per-user DB breaker:** can temporarily suppress persistence-related work after repeated database failures.
+- **Per-user request breaker:** counts each failed chat call to OpenRouter within the trailing `BREAKER_WINDOW_SECONDS`, whether the failure is an error reply; a connection that cannot be opened, drops or times out; an error OpenRouter reports after accepting the call (an error event in the stream, or an error body); or a stream that stops before its final event. A request the pipe retries automatically can therefore count more than once. A stream that ends as `response.incomplete` (for example, when the answer reaches its length limit) is a finished call, not a failure. A generation on a picture-only image model or a video model counts once, when it fails after being sent to OpenRouter. A request that ends without an error clears the count, but a request to a picture-only image model or a video model clears it only once its result is delivered, and a request the user stops does not clear it. Housekeeping tasks such as title generation neither count nor clear, and a request refused before anything is sent (such as a missing API key, or a model the pipe will not serve) neither counts nor clears; Open WebUI's merge-responses task counts but never clears. At `BREAKER_MAX_FAILURES`, that user's new requests are refused with "Temporarily disabled due to repeated errors. Please retry later." until the oldest failures age out of the window, or until a request that is still let through ends without an error and clears the count: one already under way when the limit was reached, or an exempt one. A request is exempt, and never refused by this breaker, when its last message is a tool result or a user message directly after a tool result. That is how Open WebUI calls back after running its tools to finish an answer already under way, including a callback whose message carries a tool's images. Inside internal Fusion, each panel, judge or final-answer call that fails at OpenRouter counts; when the run ends, the count, including that run's own failures, is cleared if the run finishes and any panel model answered, and kept if none did or the user stopped the run.
+- **Per-user, per-tool breaker:** counts a tool's failures in a row, keyed by tool type and name, so other tools of the same type, including the rest of an MCP server's tools, keep working. A successful call clears the count, and so does a gap longer than `BREAKER_WINDOW_SECONDS` between the tool's last failure and its next call. The gap is measured to the next call, not between failures, so a slow tool that keeps timing out still trips. Errors, per-call timeouts and running calls cancelled by the batch deadline (other than calls the idle limit had already given up on) count; an `ask_user` timeout, a call to an MCP tool whose session already closed, and a call still waiting for a slot do not. Each internal Fusion run keeps one count per tool, shared by all of its models: a tool that fails `BREAKER_MAX_FAILURES` times in a row within the run is skipped from then on. Unlike the user's own count, this one is never cleared by a quiet spell, only by a success; once the tool is skipped, only an already-running call to it can supply that success. Calls to that tool inside the run neither raise nor clear the user's own count for it, and are not skipped because of that count.
+- **Per-user DB breaker:** counts failed database reads and writes of stored reasoning, tool results and session logs within the trailing window. A successful read or write clears the count; where Redis buffers writes, a write succeeds once Redis has taken it. At the limit, the pipe skips that user's database reads and writes and shows the warning "DB ops skipped due to repeated errors." Chats still get answers, but that user's reasoning and tool results are neither saved to nor read from the database until failures age out of the window.
 
-When a tool breaker is open, tool calls are skipped and a status message is emitted to the UI (best effort).
+While a tool breaker is open, calls to that tool are skipped and the model is told why; outside internal Fusion, a best-effort status message is also sent to the UI. A turn whose tool calls are all skipped this way does not count as a failed request.
 
 ---
 

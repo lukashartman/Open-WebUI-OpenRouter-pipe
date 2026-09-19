@@ -101,16 +101,47 @@ Notes:
 - With streaming off, the wrapper the non-streaming path puts around the emitter suppresses `chat:message` and `chat:message:delta` outright, because the answer is travelling home as the return value instead. Anything raised inside the response loop that is only emitted as a card is therefore invisible on that leg; it has to come back as the return value to be seen at all.
 - When `SHOW_FINAL_USAGE_STATUS` resolves True — the reader's own copy where they have set it, otherwise the site default an administrator chooses — the pipe formats a final status description using usage/cost/tokens when present, and writes the cost segment only for a charge above zero.
 
+### 4.1 The stored output array, and who owns it
+
+A streaming turn ends with a `response.completed` event whose `output` array is what Open WebUI saves against
+the assistant message: the reasoning items, the tool cards that were shown, and the messages. Everything later
+turns replay comes from there, so who writes it matters.
+
+Open WebUI's bookkeeping depends on what it is doing, and the pipe has to match it:
+
+- **Continuing a message.** Open WebUI sets the message's existing stored output aside at stream start and puts
+  it back in front afterwards. It already holds those items, so the pipe must publish only this generation's:
+  republishing would store the earlier generation twice - and with it every hidden marker it carries, so the
+  replayed reasoning would double as well. The pipe recognises this by the message id the frontend sends only
+  when continuing.
+- **Its own tool loop.** Each time Open WebUI runs a round and calls the pipe back, it sets the turn's output
+  aside the same way, but sends no such id. This is the path on which the pipe still reads the stored output,
+  and it has to tell a round Open WebUI has just run from one already stored.
+
+That second test counts results rather than matching their ids: tool call ids are not unique - the
+chat-completions adapters number them per request - so a re-call whose id happens to match a stored one must
+still be recognised as a re-call.
+
+One consequence is worth stating plainly, because it is a deliberate choice rather than an oversight: a tool
+call left unfinished by Stop, on a message that is then continued, drops out of later history instead of being
+repaired. Open WebUI's own models behave the same way, and the events that would repair it cannot reach
+storage - `response.output_item.added` matches ids only within the new output, and `response.output_item.done`
+replaces by position - so an attempt to heal it would duplicate or corrupt the saved copy instead.
+
 ---
 
 ## 5. Streaming errors and how they surface
 
-OpenRouter can report failures mid-stream. The pipe detects streaming error payloads (for example `response.failed` or events carrying an `error` block) and converts them into an `OpenRouterAPIError`.
+OpenRouter sends `200 OK` as soon as a provider accepts a request, so a failure after that point arrives inside the answer. On both `/responses` and `/chat/completions`, the pipe detects such error payloads (for example `response.failed`, or a chunk carrying an `error` block) and converts them into an `OpenRouterAPIError`. A non-streaming reply whose body carries an `error` is treated the same way.
 
 That error is then handled by the same OpenRouter template system described in:
 - [Error Handling & User Experience](error_handling_and_user_experience.md)
 
-This keeps user-facing failures consistent between streaming and non-streaming calls.
+This keeps user-facing failures consistent between streaming and non-streaming calls. Each such error counts once toward the user's request breaker (see [Concurrency Controls & Resilience](concurrency_controls_and_resilience.md)); errors in housekeeping tasks such as title generation are not counted.
+
+A stream can also stop before its final event, without an error. If no event at all has arrived, the attempt counts as a failed call and is retried, up to three attempts in all; if every attempt comes back empty, the request ends with `CONNECTION_ERROR_TEMPLATE`, or with the `STREAM_INTERRUPTED_TEMPLATE` notice if answer text arrived earlier in the same reply. If anything has arrived, even just the event every stream opens with, whatever text has streamed (possibly none) is kept, the `STREAM_INTERRUPTED_TEMPLATE` notice is appended, and the call counts as a failed one.
+
+A connection that drops or times out is handled identically on both transports, and each failed attempt counts once. If this happens before any answer text has arrived, a streaming attempt that has sent nothing is retried; if the request still fails, it ends with `NETWORK_TIMEOUT_TEMPLATE` for a timeout or `CONNECTION_ERROR_TEMPLATE` for a failed connection. If it happens after answer text has arrived, that text is kept and the `STREAM_INTERRUPTED_TEMPLATE` notice follows it. A stream that ends with `response.incomplete` is a finished answer, not an interruption: its usage is reported as usual, and a warning says the answer ended incomplete.
 
 ---
 

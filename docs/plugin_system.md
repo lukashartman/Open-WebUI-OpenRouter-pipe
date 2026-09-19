@@ -218,7 +218,7 @@ The hook uses chain dispatch: if multiple plugins subscribe, each receives the (
 
 ### on_tool_result — Observe Tool Outcomes
 
-Fires once for every tool call the pipe resolves, as each result lands — including every tool still unfinished when its batch exceeds its timeout (those resolve as `failed`). You receive the tool name and its real execution status (`completed`, `failed`, `skipped`, or `cancelled`, before it is flattened for emission). This is an observe-only hook: there is no return value and you cannot alter the tool result. Use it for per-request tool tallies, success-rate metrics, or audit trails. It runs on the hot path with no timeout, so keep the work trivial.
+Fires once for every tool call the pipe runs in a batch, as each result lands — including every tool still unfinished when its batch exceeds its timeout (those resolve as `failed`). It does not fire for a call answered before it is queued (a missing or unknown tool, invalid arguments, a breaker that already skips the tool, an `ask_user` that is not the only call, an exhausted internal Fusion tool budget); for a call `TOOL_IDLE_TIMEOUT_SECONDS` had already given up on, even if that call later finishes; for the call whose result the pipe was waiting for when the user pressed Stop, even if it finishes during the cleanup wait; or for a call still unfinished when request cleanup cancels the request's tool workers (once `TOOL_SHUTDOWN_TIMEOUT_SECONDS` runs out, including after a Stop, or inside internal Fusion as soon as a model's answer ends). You receive the tool name and its real execution status (`completed`, `failed` or `skipped`, before it is flattened for emission). This is an observe-only hook: there is no return value and you cannot alter the tool result. Use it for per-request tool tallies, success-rate metrics, or audit trails. It runs on the hot path with no timeout, so keep the work trivial.
 
 ### on_request_retry — Observe Retry Decisions
 
@@ -855,16 +855,17 @@ async def on_tool_result(
 ) -> None:
 ```
 
-**When:** Fires once per resolved tool call, from `_execute_tool_batch` — for each tool as its result lands, and once for every tool still unfinished when its batch exceeds its timeout (those resolve as `failed`). `status` is the executor's real per-tool outcome (`completed`, `failed`, `skipped`, or `cancelled`) **before** it is flattened for emission.
+**When:** Fires once per tool call the pipe runs in a batch, from `_execute_tool_batch` — for each tool as its result lands, and once for every tool still unfinished when its batch exceeds its timeout (those resolve as `failed`). Calls answered before they are queued, calls `TOOL_IDLE_TIMEOUT_SECONDS` had already given up on, the call whose result the pipe was waiting for when the user pressed Stop, and calls still unfinished when request cleanup cancels the request's tool workers never reach this hook. `status` is the executor's real per-tool outcome (`completed`, `failed` or `skipped`) **before** it is flattened for emission.
 
 **Extra kwargs:** `request_id` — the pipe's per-request id, `metadata` — the request's OWUI metadata dict.
 
-**Dispatch location:** `_execute_tool_batch` (`pipe.py`):
+**Dispatch location:** `_hand_back_tool_result` (`pipe.py`), which `_execute_tool_batch` calls as each call's result is handed back:
 ```python
+item.future.set_result(payload)
 await self._dispatch_plugin_event(
     "dispatch_on_tool_result",
     str(item.call.get("name") or "?"),
-    resolved_status,
+    status,
     request_id=context.request_id,
     metadata=context.metadata or {},
 )
@@ -1009,7 +1010,7 @@ Each hook has a specific dispatch pattern:
 | `on_request` | **Chain** | `dict \| str \| None` | All subscribers run; each receives `current_result` kwarg; return non-`None` to set/replace result |
 | `on_request_transform` | **Void/Mutation** | `None` | All subscribers mutate the same body dict in place |
 | `on_emitter_wrap` | **Chain/Wrap** | `callable \| None` | All subscribers run; each wraps or replaces the current emitter |
-| `on_tool_result` | **Void broadcast (observer)** | `None` | Observe one resolved tool call; plain await, no timeout |
+| `on_tool_result` | **Void broadcast (observer)** | `None` | Observe one tool call the pipe ran in a batch; plain await, no timeout |
 | `on_request_retry` | **Void broadcast (observer)** | `None` | Observe one orchestrator retry decision; plain await, no timeout |
 | `on_generation_complete` | **Void broadcast (observer)** | `None` | Observe the terminal state once per request; plain await, no timeout |
 | `on_shutdown` | **Always** | `None` | Called for all plugins (not subscription-based) |
@@ -1432,7 +1433,7 @@ Use `_ensure_*()` methods — safe to call, creates on first access:
 | `_ensure_reasoning_config_manager()` | `ReasoningConfigManager` | Reasoning/thinking output configuration |
 | `_ensure_nonstreaming_adapter()` | `NonStreamingAdapter` | Non-streaming OpenRouter requests |
 | `_ensure_task_model_adapter()` | `TaskModelAdapter` | Task model (title/tags/emoji) requests |
-| `_ensure_tool_executor()` | `ToolExecutor` | Tool/function call execution with retries |
+| `_ensure_tool_executor()` | `ToolExecutor` | Tool/function call queueing, batching and execution |
 | `_ensure_responses_adapter()` | `ResponsesAdapter` | OpenRouter Responses API streaming |
 | `_ensure_chat_completions_adapter()` | `ChatCompletionsAdapter` | OpenAI-compatible chat completions |
 | `_ensure_request_orchestrator()` | `RequestOrchestrator` | Routes requests to appropriate adapter |

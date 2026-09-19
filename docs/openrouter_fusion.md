@@ -134,6 +134,8 @@ trio with the same judge; `general-fast` = that same faster trio with a Sonnet-c
 Note: `FORCE_*` provider-glob valves match model IDs literally, so tilde aliases only
 match patterns written with the leading `~`.
 
+On the internal engine, every panel, judge and final-answer call is made as the chatting user's own call. Each one that fails at OpenRouter therefore counts toward that user's request breaker; when the run ends, the count, including that run's own failures, is cleared if the run finishes and any panel model answered, and kept if none did or the user stopped the run. The breaker never cuts off a run already under way; only the user's next request can be refused. Within each run, all of its models share one count per tool: once a tool fails `BREAKER_MAX_FAILURES` times in a row, it is skipped from then on, even after a quiet spell, unless a call to it that was already running succeeds. The user's own tool breaker for normal chats is left untouched. See [Concurrency Controls & Resilience](concurrency_controls_and_resilience.md).
+
 ## Enablement — pipe valves (admin)
 
 These live on the **pipe** (the OpenRouter manifold's `Valves`) and control install/attach/default

@@ -53,26 +53,29 @@ The pipe selects an OpenRouter template based on the HTTP status:
 
 These templates are used for the `OpenRouterAPIError` path (and for certain HTTP status errors that are converted into an OpenRouter error object by reading the response body best-effort).
 
+**A failure reported inside a reply that has already started uses the same table.** OpenRouter commits `200 OK` as soon as a provider accepts a request, so a rate limit, an overloaded or unreachable provider, a provider timeout, an exhausted balance or a sign-in failure occurring after that point arrives inside the reply instead of as a status. The pipe reads the kind of failure OpenRouter names there - `error.metadata.error_type` on Chat Completions, the top-level `error_type` on Responses, the same fields the model-limits section below uses - and renders the template for the status that kind is documented with, so the person reads the message written for that failure rather than the rejected-request one. A kind the pipe does not recognise falls back to the status reported alongside it, and then to `OPENROUTER_ERROR_TEMPLATE`. One consequence matters when editing `SERVER_TIMEOUT_TEMPLATE`: a provider timeout reported this way is documented as `504`, so it renders `SERVICE_ERROR_TEMPLATE`. The timeout template is reached by a `408`, whether that is the reply's own status or the code reported inside the reply.
+
 **Every caller uses the table.** Status selection is the only thing that chooses one of these templates; no call site can pass a template that overrides it. The chat orchestrator, the outer request handler, image generation, video generation, and a streaming failure arriving after output has begun all render the same template for the same status.
 
-**One exception, and it matters for the wording of `AUTHENTICATION_ERROR_TEMPLATE`.** When the pipe cannot read its own OpenRouter API key it renders that template directly. Nothing was sent, so there is no status and no rejection by OpenRouter — the cause is local: the key setting is blank, or the value stored in it was encrypted under a `WEBUI_SECRET_KEY` that has since changed and can no longer be decrypted. The `401` shown on the card in that case is a display value the pipe supplies, not a status any server returned. Wording written for that box therefore has to fit a local configuration fault as well as a key OpenRouter rejected, which is why the built-in text says the request was not authorised "or the pipe could not read one" rather than asserting that OpenRouter refused the credentials. It is the only template in the table above reached this way; `SERVICE_ERROR_TEMPLATE` is also passed explicitly at two call sites, but both are the `>= 500` rows of the table in section B below, so they agree with it rather than override it.
+**One exception, and it matters for the wording of `AUTHENTICATION_ERROR_TEMPLATE`.** When the pipe cannot read its own OpenRouter API key it renders that template directly. Nothing was sent, so there is no status and no rejection by OpenRouter — the cause is local: the key setting is blank, or the value stored in it was encrypted under a `WEBUI_SECRET_KEY` that has since changed and can no longer be decrypted. The `401` shown on the card in that case is a display value the pipe supplies, not a status any server returned. Wording written for that box therefore has to fit a local configuration fault as well as a key OpenRouter rejected, which is why the built-in text says the request was not authorised "or the pipe could not read one" rather than asserting that OpenRouter refused the credentials. It is the only template in the table above reached this way; `SERVICE_ERROR_TEMPLATE` is also passed explicitly at two call sites, but both follow the rule for a status of `500` or above from the table in section B below, so they agree with it rather than override it.
 
-**OpenRouter's own request reference travels with the card.** When a rejection carries one, every template in the table above renders it on its own row, separate from the `error_id` the pipe generates: the pipe's id correlates the pipe's logs, and OpenRouter's is what its support can look up. A rejection that carries none renders no such row. The reference is unavailable on the two paths where no request reached OpenRouter — a key the pipe could not read, and a `5xx` raised by the connection itself or inside the pipe — so a template edited to show it should keep the row inside a conditional, as the built-in text does.
+**OpenRouter's own request reference travels with the card.** When a rejection carries one, every template in the table above renders it on its own row, separate from the `error_id` the pipe generates: the pipe's id correlates the pipe's logs, and OpenRouter's is what its support can look up. A rejection that carries none renders no such row. The reference is unavailable on the two paths where no request reached OpenRouter — a key the pipe could not read, and a `5xx` raised by the connection itself or inside the pipe — and on a failure reported inside a reply on Chat Completions, where the id OpenRouter sends is carried as `error_chunk_id` instead. A template edited to show the reference should therefore keep the row inside a conditional, as the built-in text does.
 
 **Clearing a template box and saving restores its built-in text.** Every error template valve behaves this way: leave the box empty (or containing only spaces or newlines), save, and the pipe writes that valve's factory default back, so reopening the Config tab shows the original wording ready to edit again. Only the valve that was cleared is affected. This is how an operator recovers from an edit that went wrong, since the built-in text is not otherwise visible in the interface. The same restore applies when valves are edited through Open WebUI's own Functions valve panel.
 
 ### B) Generic templated errors (network/5xx/internal)
 
-The pipe also renders Markdown templates for other exception categories:
+When a chat reply's call to OpenRouter fails without being rejected, or anything else goes wrong in the chat reply loop, the pipe picks one of these templates:
 
 | Condition | Template valve |
 | --- | --- |
-| `httpx.TimeoutException` | `NETWORK_TIMEOUT_TEMPLATE` |
-| `httpx.ConnectError` | `CONNECTION_ERROR_TEMPLATE` |
-| `httpx.HTTPStatusError` where `status_code >= 500` | `SERVICE_ERROR_TEMPLATE` |
-| any other exception | `INTERNAL_ERROR_TEMPLATE` |
+| A timeout before any answer text has arrived | `NETWORK_TIMEOUT_TEMPLATE` |
+| A connection that cannot be opened or drops, or a stream that sent nothing on every attempt, before any answer text has arrived | `CONNECTION_ERROR_TEMPLATE` |
+| A timeout, a failed or dropped connection, or a stream that sent nothing, after answer text arrived earlier in the reply | `STREAM_INTERRUPTED_TEMPLATE`, appended after the kept text |
+| An exception carrying a status of `500` or above | `SERVICE_ERROR_TEMPLATE` |
+| Any other exception | `INTERNAL_ERROR_TEMPLATE` |
 
-**Note:** The timeout template path may display a fallback `timeout_seconds` value when `HTTP_TOTAL_TIMEOUT_SECONDS` is unset (`null`). Use the timeout valves in [Valves & Configuration Atlas](valves_and_configuration_atlas.md) as the source of truth for runtime behavior.
+The timeout template's `timeout_seconds` is the limit that ran out: `HTTP_CONNECT_TIMEOUT_SECONDS` while connecting, `HTTP_SOCK_READ_SECONDS` while waiting for data, or `HTTP_TOTAL_TIMEOUT_SECONDS` for the whole request. The connection template's `error_type` names the failure (for example `ClientConnectorError`). A stream that closes early without an error, once any of its events has arrived, also gets `STREAM_INTERRUPTED_TEMPLATE`; see [Streaming Pipeline & Emitters](streaming_pipeline_and_emitters.md). Picture-only image models, video models and the panel, judge and final-answer calls inside internal Fusion report failures in their own way, and a required internal file that cannot be read shows its own message.
 
 ---
 
@@ -103,7 +106,7 @@ Minimal example:
 The pipe always provides these for `_emit_templated_error` templates:
 - `error_id`, `timestamp`, `session_id`, `user_id`, `support_email`, `support_url`
 
-It then merges in per-error variables (for example `status_code`, `reason`, `endpoint`, `timeout_seconds`).
+It then merges in per-error variables (for example `status_code`, `reason`, `timeout_seconds`, `error_type`).
 
 ### Variables for OpenRouter “request rejected” templates
 The OpenRouter error formatter supports a larger set of optional values, including:
@@ -235,9 +238,9 @@ See also: [Session Log Storage](session_log_storage.md) and [Request Identifiers
 
 ## Testing
 
-This repository includes tests for template behavior and error rendering. Prefer running the specific test module first, then the full suite:
+This repository includes tests for template behavior and error rendering. Prefer running the specific test modules first, then the full suite:
 
 ```bash
-PYTHONPATH=. .venv/bin/pytest tests/test_error_templates.py -q
+PYTHONPATH=. .venv/bin/pytest tests/test_error_handling.py tests/test_template_valve_restore.py -q
 PYTHONPATH=. .venv/bin/pytest tests -q
 ```

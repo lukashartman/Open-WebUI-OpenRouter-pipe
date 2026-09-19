@@ -142,13 +142,65 @@ For old turns, it can prune very large `function_call_output.output` strings by:
 
 This keeps replay payloads smaller while preserving recency and high-level context.
 
+### 5.4 Skeleton tool rounds (when results are not retained)
+
+With `PERSIST_TOOL_RESULTS` off and reasoning kept, a tool round the pipe executed would vanish from history
+entirely, and the reasoning that sat on either side of it would end up next to itself. Anthropic rejects a
+request whose thinking blocks are adjacent, so the pipe persists a **skeleton** of each such round instead: the
+call with its name and id but `{}` for arguments, paired with a fixed `[tool result not retained]` output that
+carries the round's real status. Nothing a person typed and nothing a tool returned is kept.
+
+Three properties follow, and each is load-bearing:
+
+- **The pair is complete**, so the orphan rule in §5.2 keeps it. A skeleton call always has its skeleton output.
+- **It lives exactly as long as the reasoning it scaffolds.** Skeletons are written only for rounds whose turn
+  persisted reasoning, they are deleted when that reasoning is deleted, and with reasoning retention `disabled`
+  none are written at all.
+- **It is dropped wherever the reasoning is dropped.** One helper decides this, and every stage that removes
+  reasoning from a request calls it: the sanitizer, the retry that strips replayed reasoning after a provider
+  rejects its signatures, and the conversion to `/chat/completions`. A skeleton round must never reach a
+  provider without the reasoning it exists to separate.
+
+Skeletons are never published as output items, so Open WebUI neither renders them nor re-runs them; they exist
+only behind the hidden markers in the pipe's own artifact store.
+
+---
+
 ---
 
 ## 6. Reasoning replay and `PERSIST_REASONING_TOKENS`
 
-When replayed artifacts include reasoning items, the pipe can optionally record references in `replayed_reasoning_refs` so the caller can delete those artifacts after replay when reasoning retention is limited to a single turn.
+When replayed artifacts include reasoning items, the pipe can optionally record references in `replayed_reasoning_refs` so the caller can delete those artifacts after replay when reasoning retention is limited to a single turn. Under `next_reply`, a Continue is the case to watch: the cleanup that runs at the end of a request keeps the rows of the message that request is still writing, so continuing an answer does not delete the reasoning of the generation it continues. Skeleton rows (§5.4) are deleted with the reasoning they scaffold.
 
 System default is `PERSIST_REASONING_TOKENS="conversation"`; see [Valves & Configuration Atlas](valves_and_configuration_atlas.md) for the exact semantics and defaults.
+
+### 6.1 Where a replayed reasoning item goes
+
+A model produces reasoning at a particular moment: before a tool call, after its result, or between two
+sentences of an answer. Open WebUI stores the answer as text, so that position is lost unless the pipe records
+it. Each persisted reasoning item therefore carries an anchor - which call it preceded or followed, or which
+assistant message it sat before - and replay puts it back in that place rather than appending it.
+
+Anchors are **scoped to a turn**, where a turn is the region between user messages. Tool `call_id` values are
+not unique across a conversation: the chat-completions adapters number them per request, so the same id can
+appear in several turns. Binding an anchor only within its own turn is what keeps a reasoning item from
+attaching itself to an unrelated call with the same id. Open WebUI's own synthetic "Here are the images from
+the tool results above" message counts as a user message for this purpose, which splits the region at the same
+point on both the generating and the replaying side.
+
+### 6.2 An answer continued across more than one request
+
+"Continue response" adds a second generation to the same assistant message, and Open WebUI's own tool loop can
+call the pipe several times within one turn. Ordinals are counted per request, so without care the continuation
+would number its first call `0` again and its reasoning would bind to the first generation's call - placing two
+thinking blocks side by side, the shape providers reject.
+
+The pipe therefore offsets a continuation's ordinals by what the turn already contains: the calls and the
+assistant messages the request carries before this generation starts. A turn that ends on reasoning gets one
+further step, so the continuation's first block is placed after its own text rather than beside the block that
+ended the previous generation. The offsets apply only while streaming: on a non-streaming Continue, Open WebUI
+replaces the message's stored output with just the returned content, so the earlier generation's calls are no
+longer there to count.
 
 ---
 

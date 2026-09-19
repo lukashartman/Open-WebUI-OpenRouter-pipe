@@ -134,7 +134,7 @@ Operator tools you can use immediately:
 | Symptom | Likely cause | Mitigation |
 | --- | --- | --- |
 | Repeated startup/warmup failures | API key missing, DNS blocked, or provider unreachable. | Verify credentials and outbound network; inspect backend logs for the root cause; restart to re-run startup checks. |
-| Users see DB/persistence warnings | Database unavailable or migrations missing. | Check DB connectivity; breakers heal automatically once writes succeed. |
+| Users see DB/persistence warnings | Database unavailable or migrations missing. | Check DB connectivity. While the persistence breaker is open the pipe attempts no database work, so it reopens only when the failures age out of `BREAKER_WINDOW_SECONDS`; a successful read or write then clears the count. |
 | Redis queue never drains | Flush lock stuck or DB writes failing. | Inspect logs for DB errors; restart one worker to release locks; consider disabling Redis until resolved. |
 | Attachments ignored | Selected model lacks the capability, or size/count valves were exceeded. | Pick a capable model or adjust relevant multimodal valves. |
 | Tool loops stop early | `MAX_FUNCTION_CALL_LOOPS` reached (Pipeline mode only). The model receives stub responses for pending calls and gets a synthesis turn. | Raise the valve if the model needs more rounds, or simplify the request. |

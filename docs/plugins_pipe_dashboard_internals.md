@@ -73,7 +73,7 @@ The plugin subscribes to six hooks, all at priority **50**:
 | `on_models` | Appends `{"id": "pipe-dashboard", "name": "Pipe Dashboard"}` to the model list |
 | `on_request` | Intercepts requests sent to the `pipe-dashboard` model ID; starts live-session tracking for every other request |
 | `on_emitter_wrap` | Wraps the stream emitter to capture usage snapshots and tool-start events for the Live feed |
-| `on_tool_result` | Records each resolved tool call's outcome on the live session |
+| `on_tool_result` | Records on the live session the outcome of each tool call the pipe runs in a batch |
 | `on_request_retry` | Increments the live session's retry counter |
 | `on_generation_complete` | Finalizes the live session and persists a usage row when collection is enabled |
 
@@ -693,7 +693,7 @@ The Live and Usage tabs are backed by two layers: an in-memory `SessionTracker` 
 | `started`, `done` | float / null | Unix timestamps; `done` is `null` while in flight |
 | `elapsed_s` | float | Seconds since `started`, frozen at `done` |
 | `tokens_in`, `tokens_cached`, `tokens_out` | int | Cumulative token counts |
-| `tools_ok`, `tools_failed` | int | Resolved tool-call outcomes |
+| `tools_ok`, `tools_failed` | int | Outcomes of the tool calls the pipe ran in a batch, as `on_tool_result` reports them |
 | `cost`, `task_cost` | float | Running cost; `task_cost` is the folded-in task portion |
 | `worker_pid` | int | The worker that owns the row |
 

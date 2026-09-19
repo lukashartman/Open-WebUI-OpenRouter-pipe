@@ -13,6 +13,11 @@ During a chat, the pipe can persist structured “artifacts” so future turns c
 Persisted artifacts include (at least):
 - Reasoning items (when enabled and retention permits).
 - Tool execution artifacts (calls/outputs), subject to replay filtering rules and retention pruning.
+- Skeleton tool rounds, when results are not kept but reasoning is. A skeleton is the shape of a round the
+  pipe ran and nothing more: the call's name and id with `{}` in place of its arguments, paired with a fixed
+  `[tool result not retained]` output carrying the round's real status. It exists so the reasoning that sat on
+  either side of that round does not end up next to itself on the following turn, which providers reject.
+  Nothing a person typed and nothing a tool returned is stored in one.
 
 **Note:** Not every artifact type is replayed verbatim. The pipe filters certain tool artifact types to avoid wasting context window and to reduce provider-side errors.
 
@@ -105,7 +110,7 @@ High-level behavior:
 
 Failure handling (operator-relevant):
 - If Redis is unavailable, the pipe degrades to direct database writes and continues serving requests.
-- If database writes repeatedly fail for a user/session, a breaker can temporarily disable persistence and emit warnings rather than causing cascading failures.
+- If a user's database reads or writes keep failing, a breaker skips that user's database work for a while and shows a warning rather than letting the failures cascade.
 
 See [Valves & Configuration Atlas](valves_and_configuration_atlas.md) for Redis-related valves and their defaults.
 
@@ -124,6 +129,11 @@ Reasoning retention controls whether replayed reasoning artifacts are deleted af
 - `disabled`: no reasoning is retained.
 - `next_reply`: reasoning is kept only until the next assistant reply finishes, then deleted.
 - `conversation`: reasoning is kept for the full chat history (until time-based cleanup removes it).
+
+Skeleton tool rounds follow this setting rather than having one of their own: they are written only for a turn
+that persisted reasoning, and they are deleted when that reasoning is deleted, so `disabled` writes none at
+all. Under `next_reply` the cleanup that runs at the end of a request spares the rows of the message that
+request is still writing, so continuing an answer does not delete the generation it continues.
 
 ### Tool output pruning
 Tool artifacts are also subject to replay pruning based on `TOOL_OUTPUT_RETENTION_TURNS` (how far back tool results remain eligible for replay).

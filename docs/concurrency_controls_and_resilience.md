@@ -22,6 +22,7 @@ Tool execution is constrained to prevent a single request (or a single user) fro
 
 - **Global tool semaphore:** `MAX_PARALLEL_TOOLS_GLOBAL` caps the total number of tool executions across all requests in the process.
 - **Per-request tool semaphore:** `MAX_PARALLEL_TOOLS_PER_REQUEST` caps tool parallelism within a single request.
+- **`ask_user` exemption:** Open WebUI's built-in `ask_user` waits on a person, so it takes no slot from either tool semaphore.
 - **Batching and timeouts:** tool loop ceilings and timeouts are controlled by `MAX_FUNCTION_CALL_LOOPS`, `TOOL_BATCH_CAP`, `TOOL_TIMEOUT_SECONDS`, `TOOL_BATCH_TIMEOUT_SECONDS`, and `TOOL_IDLE_TIMEOUT_SECONDS`.
 
 See [Tooling & Integrations](tooling_and_integrations.md) for tool-specific behavior and schema handling.
@@ -30,19 +31,19 @@ See [Tooling & Integrations](tooling_and_integrations.md) for tool-specific beha
 
 ## Breakers (fast-fail protection)
 
-Breakers prevent repeated failures from cascading into continuous retries and log storms. They are governed by:
+Breakers stop repeated failures from turning into continuous retries and log storms. The three breakers below are per user; each internal Fusion run also keeps one count per tool, shared by all of its models, which uses `BREAKER_MAX_FAILURES` but ignores the window. The per-user breakers are governed by:
 
 - `BREAKER_MAX_FAILURES`
 - `BREAKER_WINDOW_SECONDS`
-- `BREAKER_HISTORY_SIZE`
+- `BREAKER_HISTORY_SIZE` (the persistence breaker's memory; it never changes that breaker's verdict)
 
 Breaker scopes include:
 
-- **Per-user request breaker:** blocks new requests for a user when repeated failures occur within the breaker window.
-- **Per-user persistence breaker:** skips database persistence work for a user when repeated DB failures occur (requests can continue with reduced durability).
-- **Per-user, per-tool breaker:** skips execution of a specific tool (keyed by tool type and tool name) when that tool fails repeatedly; other tools keep working.
+- **Per-user request breaker:** refuses a user's new requests once `BREAKER_MAX_FAILURES` failed calls to OpenRouter fall within the breaker window. For chat calls, the failures that count are error replies; connections that cannot be opened, drop or time out; errors OpenRouter reports after accepting a call; and streams that stop before their final event. A generation on a picture-only image model or a video model counts once, when it fails after being sent to OpenRouter. Failed panel, judge and final-answer calls made by internal Fusion count too. A request that ends without an error clears the count, but a request to a picture-only image model or a video model clears it only once its result is delivered, and an internal Fusion run clears it only if a panel model answered; a request the user stops does not clear it. Housekeeping tasks such as title generation neither count nor clear; Open WebUI's merge-responses task counts but never clears. A request whose last message is a tool result, or a user message right after one, is never refused by this breaker: such a request is how Open WebUI finishes an answer already under way.
+- **Per-user persistence breaker:** skips a user's database reads and writes after repeated DB failures within the breaker window; requests continue with reduced durability. A successful read or write clears the count; where Redis buffers writes, a write succeeds once Redis has taken it. Nothing is attempted while the breaker is open, so only failures ageing out reopen it.
+- **Per-user, per-tool breaker:** skips a specific tool, keyed by tool type and tool name, after it fails `BREAKER_MAX_FAILURES` times in a row; other tools keep working. A successful call clears the count, and so does a gap longer than the breaker window between the tool's last failure and its next call, which is why a slow tool that keeps timing out still trips. Each internal Fusion run keeps one count per tool, shared by all of its models: once a tool fails `BREAKER_MAX_FAILURES` times in a row during the run, it is skipped from then on, even after a quiet spell, unless a call to it that was already running succeeds. The user's own count is left unaffected.
 
-Breakers are self-healing: once failures age out of the window (or a successful operation occurs where applicable), normal operation resumes without operator intervention.
+Breakers also recover on their own: the request and persistence breakers once their failures age out of the window, and a user's tool breaker once a call to the tool comes more than a full window after its last failure. A turn whose tool calls are all skipped by a tool breaker does not count as a failed request, so a broken tool cannot lock a user out of the pipe.
 
 ---
 
