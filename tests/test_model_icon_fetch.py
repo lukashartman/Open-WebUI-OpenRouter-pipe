@@ -741,44 +741,59 @@ async def test_converting_icons_does_not_stall_the_event_loop(icon_handler):
     of them must come in under half of that. On this tree a single decode is ~0.26s and
     the worst stall drops from ~0.28s to ~0.014s, so the margin is twenty-fold -- but a
     machine slow enough to change the decode time changes the bound with it.
+
+    The ten conversions are measured up to three times, each run starting without a decode
+    pool. A conversion held on the loop stalls it in every run, while one unrelated pause
+    of the machine (seen once, a 0.16s stall against a 0.27s decode) spoils only the run it
+    lands in.
     """
     payload = _png(4900)
     started = time.perf_counter()
     mm._icon_png_bytes(payload)
     one_decode = time.perf_counter() - started
 
-    stalls: list[float] = []
-    running = True
+    async def _worst_stall() -> float:
+        pool, icon_handler._decode_pool = icon_handler._decode_pool, None
+        if pool is not None:
+            pool.shutdown(wait=True)
+        stalls: list[float] = []
+        running = True
 
-    async def _tick() -> None:
-        previous = time.perf_counter()
-        while running:
-            await asyncio.sleep(0.005)
-            now = time.perf_counter()
-            stalls.append(now - previous)
-            previous = now
+        async def _tick() -> None:
+            previous = time.perf_counter()
+            while running:
+                await asyncio.sleep(0.005)
+                now = time.perf_counter()
+                stalls.append(now - previous)
+                previous = now
 
-    ticker = asyncio.create_task(_tick())
-    await asyncio.sleep(0.05)
-    stalls.clear()
-    try:
-        for _ in range(10):
-            session = _Session(
-                _Response(_LiteralBody(payload), {"Content-Type": "image/png"})
-            )
-            icon_handler._vetted_http_session = session
-            assert await icon_handler._fetch_image_as_data_url(
-                "https://cdn.example.com/i.png"
-            )
-    finally:
-        running = False
-        await asyncio.sleep(0.02)
-        ticker.cancel()
+        ticker = asyncio.create_task(_tick())
+        await asyncio.sleep(0.05)
+        stalls.clear()
+        try:
+            for _ in range(10):
+                session = _Session(
+                    _Response(_LiteralBody(payload), {"Content-Type": "image/png"})
+                )
+                icon_handler._vetted_http_session = session
+                assert await icon_handler._fetch_image_as_data_url(
+                    "https://cdn.example.com/i.png"
+                )
+        finally:
+            running = False
+            await asyncio.sleep(0.02)
+            ticker.cancel()
+        assert stalls, "the ticker never ran"
+        return max(stalls)
 
-    assert stalls, "the ticker never ran"
-    assert max(stalls) < one_decode / 2, (
-        f"the loop stalled for {max(stalls):.3f}s while a single decode costs "
-        f"{one_decode:.3f}s, so the conversion is running on the loop"
+    worst: list[float] = []
+    for _ in range(3):
+        worst.append(await _worst_stall())
+        if worst[-1] < one_decode / 2:
+            break
+    assert worst[-1] < one_decode / 2, (
+        f"the loop stalled for {', '.join(f'{stall:.3f}s' for stall in worst)} in {len(worst)} runs while a "
+        f"single decode costs {one_decode:.3f}s, so the conversion is running on the loop"
     )
 
 
