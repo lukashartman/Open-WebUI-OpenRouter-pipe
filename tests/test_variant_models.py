@@ -707,16 +707,24 @@ class TestVariantRegistryEnforcement:
             OpenRouterModelRegistry._zdr_model_ids = original_zdr
 
 
-def test_is_zdr_capable_suffixed_video_id_still_blocked():
+def test_a_video_variant_answers_from_the_roster_like_any_other_model():
+    """Issue #61: a video id is not exempt from the roster, with or without a routing suffix.
+
+    This asserted False for both ids while both were on the roster. The exemption it pinned
+    was refuted by measurement (see `test_the_roster_decides_retention_even_for_an_image_only_model`).
+    Both directions are asserted here so that neither a constant nor a restored exemption passes.
+    """
     from open_webui_openrouter_pipe.models.registry import OpenRouterModelRegistry
 
     original_specs = dict(OpenRouterModelRegistry._specs)
     original_zdr = OpenRouterModelRegistry._zdr_model_ids
     try:
         OpenRouterModelRegistry._specs["openai.sora-2-pro"] = {"features": {"video_generation"}}
+        OpenRouterModelRegistry._specs["vendor.unlisted-video"] = {"features": {"video_generation"}}
         OpenRouterModelRegistry._zdr_model_ids = {"openai.sora-2-pro", "openai.sora-2-pro:nitro"}
-        assert OpenRouterModelRegistry.is_zdr_capable("openai/sora-2-pro:nitro") is False
-        assert OpenRouterModelRegistry.is_zdr_capable("openai/sora-2-pro") is False
+        assert OpenRouterModelRegistry.is_zdr_capable("openai/sora-2-pro:nitro") is True
+        assert OpenRouterModelRegistry.is_zdr_capable("openai/sora-2-pro") is True
+        assert OpenRouterModelRegistry.is_zdr_capable("vendor/unlisted-video") is False
     finally:
         OpenRouterModelRegistry._specs = original_specs
         OpenRouterModelRegistry._zdr_model_ids = original_zdr

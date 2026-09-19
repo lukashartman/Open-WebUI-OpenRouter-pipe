@@ -83,6 +83,80 @@ def test_the_zdr_models_only_gate_admits_the_same_variants(zdr_registry, variant
     )
 
 
+
+# --- issue #61: image and video models answer from OpenRouter's list, not from a constant ----------------
+
+_ZDR_IMAGE = "krea/krea-2-medium-turbo"
+_PLAIN_IMAGE = "openai/gpt-image-2.5-flare"
+_ZDR_VIDEO = "some-provider/a-zdr-video-model"
+_PLAIN_VIDEO = "minimax/hailuo-3-max"
+
+
+@pytest.fixture
+def media_registry(monkeypatch):
+    """A catalog holding image and video models, half of them on OpenRouter's ZDR list.
+
+    Measured 2026-09-20 against the live list: 14 of the 52 models on `/images/models` are in
+    `/endpoints/zdr`, `krea/krea-2-medium-turbo` among them, and 0 of the 29 on `/videos/models`.
+    The video arm therefore uses an id no video model carries today -- it is the arm that fails
+    the day OpenRouter lists one, which is exactly the drift a hardcoded answer cannot see.
+    """
+    def image_spec():
+        return {"features": {"image_generation"}, "architecture": {"output_modalities": ["image"]}}
+
+    def video_spec():
+        return {"features": {"video_generation", "video_output"}, "architecture": {"output_modalities": ["video"]}}
+
+    norms = {name: ModelFamily.base_model(name) for name in
+             (_ZDR_IMAGE, _PLAIN_IMAGE, _ZDR_VIDEO, _PLAIN_VIDEO)}
+    monkeypatch.setattr(Registry, "_zdr_model_ids", {norms[_ZDR_IMAGE], norms[_ZDR_VIDEO]})
+    monkeypatch.setattr(Registry, "_specs", {
+        norms[_ZDR_IMAGE]: image_spec(),
+        norms[_PLAIN_IMAGE]: image_spec(),
+        norms[_ZDR_VIDEO]: video_spec(),
+        norms[_PLAIN_VIDEO]: video_spec(),
+    })
+    return norms
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [(_ZDR_IMAGE, True), (_PLAIN_IMAGE, False), (_ZDR_VIDEO, True), (_PLAIN_VIDEO, False)],
+    ids=["image-on-the-list", "image-not-on-it", "video-on-the-list", "video-not-on-it"],
+)
+def test_a_media_model_is_as_zdr_capable_as_openrouter_says_it_is(media_registry, model, expected):
+    """Issue #61: the answer comes from the list, for every modality.
+
+    The pipe used to answer `False` for any model on the dedicated image API and for any video
+    model, before reading the list at all. OpenRouter publishes one list covering every modality,
+    and it had 14 image models in it, so a privacy-conscious admin was shown none of them and,
+    with enforcement on, could generate no images at all.
+
+    Both values per modality, so neither a constant nor a per-modality constant passes.
+    """
+    assert Registry.is_zdr_capable(model) is expected
+
+
+@pytest.mark.parametrize(
+    ("model", "restricted"),
+    [(_ZDR_IMAGE, False), (_PLAIN_IMAGE, True), (_ZDR_VIDEO, False), (_PLAIN_VIDEO, True)],
+    ids=["image-on-the-list", "image-not-on-it", "video-on-the-list", "video-not-on-it"],
+)
+def test_show_only_zdr_models_keeps_the_media_models_openrouter_lists(media_registry, model, restricted):
+    """The gate the reporter hit: "Show only ZDR models" hid every pure image model."""
+    from open_webui_openrouter_pipe import Pipe
+
+    pipe = Pipe()
+    pipe.valves.ZDR_MODELS_ONLY = True
+    norm_id = media_registry[model]
+    reasons = pipe._model_restriction_reasons(
+        norm_id,
+        valves=pipe.valves,
+        allowlist_norm_ids={norm_id},
+        catalog_norm_ids={norm_id},
+    )
+    assert ("ZDR_MODELS_ONLY" in reasons) is restricted, reasons
+
 # Every place that asks the ZDR question, pinned in both directions. A census that only
 # looks for offenders reports green when it matches NOTHING -- rename `is_zdr_capable`,
 # or move a gate into a module the walk does not cover, and `offenders` is empty because

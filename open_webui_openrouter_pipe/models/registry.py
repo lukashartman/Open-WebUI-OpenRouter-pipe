@@ -170,10 +170,6 @@ def supports_phase_model(model_id: str) -> bool:
 
 def uses_dedicated_image_api(spec: Any) -> bool:
     """True when a model emits images and no text, so it answers only on the image API.
-
-    The router and the ZDR gate must agree on this: one decides which transport opens, the
-    other decides whether a retention control can be carried on it. Two copies would drift
-    into a state where a request is admitted on one reading and stripped on the other.
     """
     if not isinstance(spec, dict):
         return False
@@ -686,8 +682,9 @@ class OpenRouterModelRegistry:
                 "description": item.get("description"),
                 "pricing": pricing,
                 "architecture": item.get("architecture") if isinstance(item.get("architecture"), dict) else {},
-                "zdr_capable": False,
             }
+            if cls._zdr_model_ids is not None:
+                new_specs[norm_id]["zdr_capable"] = norm_id in cls._zdr_model_ids
 
         cls._specs = new_specs
         cls._id_map = new_id_map
@@ -906,8 +903,9 @@ class OpenRouterModelRegistry:
                 "description": item.get("description"),
                 "pricing": pricing,
                 "architecture": architecture,
-                "zdr_capable": False,
             }
+            if cls._zdr_model_ids is not None:
+                new_specs[norm_id]["zdr_capable"] = norm_id in cls._zdr_model_ids
 
         cls._specs = new_specs
         cls._id_map = new_id_map
@@ -1008,11 +1006,6 @@ class OpenRouterModelRegistry:
         # pipe itself synthesises (`:nitro`, `:floor`, `:online`), whose endpoints ARE
         # the base model's.
         lookup = norm if norm in cls._specs else base_norm
-        spec = cls._specs.get(lookup) or cls._specs.get(base_norm) or {}
-        if "video_generation" in set(spec.get("features") or set()):
-            return False
-        if uses_dedicated_image_api(spec):
-            return False
         if cls._zdr_model_ids is None:
             return None
         return lookup in cls._zdr_model_ids

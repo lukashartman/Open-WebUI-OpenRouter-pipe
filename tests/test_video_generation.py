@@ -241,26 +241,47 @@ def test_a_non_list_capability_declaration_does_not_promote_the_knob(declared):
     )
 
 
-def test_video_registry_marks_models_non_zdr_and_filterable():
-    OpenRouterModelRegistry._zdr_model_ids = {"openai.sora-2-pro"}
+@pytest.mark.parametrize("listed_as_zdr", [True, False])
+def test_a_video_model_is_filtered_on_what_the_roster_says(listed_as_zdr):
+    """Issue #61: a video model answers from OpenRouter's roster, like every other model.
+
+    This used to assert that a video model on the roster was still reported non-ZDR. The
+    premise was that the roster describes a transport such a model never uses; measured on
+    2026-09-20 that is not so. A roster entry names a model and the provider serving it, and
+    for a generation-only model that provider is its only endpoint. No video model is on the
+    roster today (0 of 29), so this arm uses one that is -- which is the point: a hardcoded
+    answer cannot notice the day OpenRouter adds one.
+    """
+    OpenRouterModelRegistry._zdr_model_ids = {"openai.sora-2-pro"} if listed_as_zdr else set()
     OpenRouterModelRegistry.register_video_models([VIDEO_BY_ID["openai/sora-2-pro"]])
 
     assert ModelFamily.supports("video_generation", "openai.sora-2-pro") is True
-    assert OpenRouterModelRegistry.is_zdr_capable("openai.sora-2-pro") is False
+    assert OpenRouterModelRegistry.is_zdr_capable("openai.sora-2-pro") is listed_as_zdr
 
     pipe = Pipe()
     pipe.valves.ZDR_MODELS_ONLY = True
     filtered = pipe._apply_model_filters(OpenRouterModelRegistry.list_models(), pipe.valves)
-    assert filtered == []
+    assert (filtered != []) is listed_as_zdr, filtered
 
 
 @pytest.mark.parametrize("listed_as_zdr", [True, False])
-def test_a_transport_that_cannot_carry_retention_outranks_the_zdr_roster(listed_as_zdr):
-    """The exemption has to beat set membership, not merely fill in when the set is silent.
+def test_the_roster_decides_retention_even_for_an_image_only_model(listed_as_zdr):
+    """Issue #61. This test asserted the opposite until its premise was measured and refuted.
 
-    A model reachable only over the image API cannot carry a retention key at all, so an
-    upstream roster listing it as ZDR-capable is answering about a transport this model
-    never uses. Enforcement must refuse it rather than generate with the control stripped.
+    The old rule was that a model reachable only over the image API cannot carry a retention
+    key, so a roster entry for it "is answering about a transport this model never uses", and
+    enforcement should refuse it rather than generate with the control stripped.
+
+    Measured 2026-09-20 against the live API, for the model the reporter used: the roster's
+    entry for `krea/krea-2-medium-turbo` names provider Krea, and `/models/.../endpoints`
+    shows Krea is its ONLY endpoint, with `output_modalities: ["image"]`. There is no other
+    transport for the entry to be about. Retention is a property of the endpoint that serves
+    the model, not of the HTTP route the client takes to reach it.
+
+    Nothing is generated with the control stripped either: a model the roster does not list
+    is still refused, by the same gate, before a request is built -- the second arm here.
+    Refusing a zero-retention endpoint because a redundant flag cannot be attached denied 14
+    of OpenRouter's 52 image models to exactly the admins who care most about retention.
     """
     OpenRouterModelRegistry._specs["vendor.image-only"] = {
         "architecture": {"output_modalities": ["image"]},
@@ -270,9 +291,9 @@ def test_a_transport_that_cannot_carry_retention_outranks_the_zdr_roster(listed_
         {"vendor.image-only"} if listed_as_zdr else set()
     )
 
-    assert OpenRouterModelRegistry.is_zdr_capable("vendor.image-only") is False, (
-        "an image-only model has no transport that defines a retention key; being named on "
-        f"the ZDR roster cannot change that. listed_as_zdr={listed_as_zdr}"
+    assert OpenRouterModelRegistry.is_zdr_capable("vendor.image-only") is listed_as_zdr, (
+        "an image-only model's retention comes from the roster entry for the endpoint that "
+        f"serves it, the only endpoint it has. listed_as_zdr={listed_as_zdr}"
     )
 
 
