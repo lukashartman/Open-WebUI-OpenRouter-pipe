@@ -26,7 +26,11 @@ from ...core.config import (
     _apply_owui_forward_user_headers,
     _select_openrouter_http_referer,
 )
-from ...core.errors import OpenRouterAPIError, _build_openrouter_api_error
+from ...core.errors import (
+    OpenRouterAPIError,
+    _build_openrouter_api_error,
+    is_sign_in_failure,
+)
 from ...core.logging_system import SessionLogger
 from ...core.timing_logger import timed, timing_mark
 from ...core.utils import _apply_retry_after_metadata
@@ -63,6 +67,23 @@ def _should_retry_stream(emitted_any: bool, exc: BaseException | None) -> bool:
     if emitted_any:
         return False
     return isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
+
+
+_STREAM_END_EVENTS = frozenset({"response.completed", "response.done", "response.incomplete"})
+
+
+def _record_failed_call(pipe: Pipe, breaker_key: str | None) -> None:
+    if breaker_key:
+        pipe._circuit_breaker.record_failure(breaker_key)
+
+
+@contextlib.asynccontextmanager
+async def _count_failed_call(pipe: Pipe, breaker_key: str | None) -> AsyncGenerator[None, None]:
+    try:
+        yield
+    except (OpenRouterAPIError, aiohttp.ClientError, TimeoutError):
+        _record_failed_call(pipe, breaker_key)
+        raise
 
 
 class ResponsesAdapter:
@@ -155,37 +176,20 @@ class ResponsesAdapter:
                 retry=_retry_streaming,
                 reraise=True,
             )
-            recorded_for_attempt = False
-
-            def _record_breaker_failure() -> None:
-                """One breaker failure per attempt, however many handlers observe it.
-
-                A 4xx records at the response check and then raises; the producer
-                handler catches that same exception and recorded it a second time, so a
-                single failed request counted twice and a user was shed at half the
-                configured threshold.
-                """
-                nonlocal recorded_for_attempt
-                if breaker_key and not recorded_for_attempt:
-                    recorded_for_attempt = True
-                    self._pipe._circuit_breaker.record_failure(breaker_key)
-
             try:
                 async for attempt in retryer:
-                    if breaker_key and not self._pipe._circuit_breaker.allows(breaker_key):
-                        raise RuntimeError("Breaker open for user during stream")
                     with attempt:
-                        recorded_for_attempt = False
                         buf = bytearray()
                         event_data_parts: list[bytes] = []
                         stream_complete = False
                         try:
                             timing_mark("responses_http_request_start")
-                            async with session.post(url, json=request_body, headers=headers) as resp:
+                            async with _count_failed_call(self._pipe, breaker_key), session.post(
+                                url, json=request_body, headers=headers
+                            ) as resp:
                                 timing_mark("responses_http_headers_received")
                                 if resp.status >= 400:
                                     error_body = await _debug_print_error_response(resp, logger=self.logger)
-                                    _record_breaker_failure()
                                     extra_meta: dict[str, Any] = {}
                                     _apply_retry_after_metadata(extra_meta, resp.headers)
                                     rate_scope = (
@@ -213,8 +217,6 @@ class ResponsesAdapter:
                                         first_chunk_received = True
                                         timing_mark("responses_first_chunk")
                                     view = memoryview(chunk)
-                                    if breaker_key and not self._pipe._circuit_breaker.allows(breaker_key):
-                                        raise RuntimeError("Breaker open during stream")
                                     buf.extend(view)
                                     start_idx = 0
                                     while True:
@@ -258,11 +260,12 @@ class ResponsesAdapter:
                                         await chunk_queue.put((seq, data_blob))
                                         seq += 1
                                         emitted_any = True
+                                if not emitted_any:
+                                    raise aiohttp.ClientPayloadError("OpenRouter closed the stream before sending anything")
                         except Exception as producer_exc:
-                            is_auth_failure = (
-                                isinstance(producer_exc, OpenRouterAPIError)
-                                and getattr(producer_exc, "status", None) in {401, 403}
-                            )
+                            is_auth_failure = isinstance(
+                                producer_exc, OpenRouterAPIError
+                            ) and is_sign_in_failure(producer_exc)
                             if is_auth_failure:
                                 self._pipe._note_auth_failure()
                                 self.logger.warning(
@@ -273,7 +276,6 @@ class ResponsesAdapter:
                                 self.logger.exception(
                                     "Producer encountered error while streaming from OpenRouter"
                                 )
-                            _record_breaker_failure()
                             raise
                         if stream_complete:
                             break
@@ -350,6 +352,7 @@ class ResponsesAdapter:
         pending_events: dict[int, dict[str, Any] | None] = {}
         next_seq = 0
         done_workers = 0
+        stream_ended = False
         coalescer = NagleCoalescer(min_flush_chars=nagle_min_chars)
 
         first_event_from_queue = False
@@ -413,7 +416,9 @@ class ResponsesAdapter:
                         continue
                     streaming_error = self._pipe._ensure_error_formatter()._extract_streaming_error_event(current, requested_model)
                     if streaming_error is not None:
+                        _record_failed_call(self._pipe, breaker_key)
                         raise streaming_error
+                    stream_ended = stream_ended or current.get("type") in _STREAM_END_EVENTS
                     coalescer.process_event(current, yield_queue, passthrough=passthrough_deltas)
 
                 drained = 0
@@ -435,7 +440,9 @@ class ResponsesAdapter:
                             continue
                         streaming_error = self._pipe._ensure_error_formatter()._extract_streaming_error_event(current, requested_model)
                         if streaming_error is not None:
+                            _record_failed_call(self._pipe, breaker_key)
                             raise streaming_error
+                        stream_ended = stream_ended or current.get("type") in _STREAM_END_EVENTS
                         coalescer.process_event(current, yield_queue, passthrough=passthrough_deltas)
 
                 coalescer.flush_all_to(yield_queue, force=False)
@@ -455,6 +462,8 @@ class ResponsesAdapter:
                 yield item
 
             await producer_task
+            if not stream_ended:
+                _record_failed_call(self._pipe, breaker_key)
         finally:
             if not producer_task.done():
                 producer_task.cancel()
@@ -522,14 +531,11 @@ class ResponsesAdapter:
 
         async for attempt in retryer:
             with attempt:
-                if breaker_key and not self._pipe._circuit_breaker.allows(breaker_key):
-                    raise RuntimeError("Breaker open for user during request")
-
-                async with session.post(url, json=request_params, headers=headers) as resp:
+                async with _count_failed_call(self._pipe, breaker_key), session.post(
+                    url, json=request_params, headers=headers
+                ) as resp:
                     if resp.status >= 400:
                         error_body = await _debug_print_error_response(resp, logger=self.logger)
-                        if breaker_key:
-                            self._pipe._circuit_breaker.record_failure(breaker_key)
                         extra_meta: dict[str, Any] = {}
                         _apply_retry_after_metadata(extra_meta, resp.headers)
                         rate_scope = (
@@ -548,6 +554,11 @@ class ResponsesAdapter:
                         )
                     payload = await resp.json()
                     _debug_print_response(payload, logger=self.logger)
+                    reported_error = self._pipe._ensure_error_formatter()._extract_streaming_error_event(
+                        payload, request_params.get("model")
+                    )
+                    if reported_error is not None:
+                        raise reported_error
                     return payload
         self.logger.error("Responses API call completed without yielding a response body; returning empty payload.")
         return {}

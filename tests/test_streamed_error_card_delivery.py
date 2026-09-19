@@ -22,7 +22,9 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import MagicMock
 
+import aiohttp
 import pytest
 
 from open_webui_openrouter_pipe import Pipe, ResponsesBody
@@ -160,6 +162,62 @@ async def test_the_catch_all_card_reaches_a_browser_that_already_has_text(
         "the non-streaming leg keeps only the return value, so the same join has to be "
         f"there too. got {returned!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# An answer cut off by a dropped connection or a timeout
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [aiohttp.ClientPayloadError("Response payload is not completed"), aiohttp.ServerDisconnectedError(), TimeoutError()],
+    ids=["payload-cut-off", "server-disconnected", "timed-out"],
+)
+@pytest.mark.parametrize(
+    ("partial", "notice", "marker"),
+    [
+        ("The capital of France is", "### Cut short\n\nThe stream for {model} stopped.", "Cut short"),
+        ("Photosynthesis begins when", "### Stream stopped\n\nRetry the message.", "Stream stopped"),
+    ],
+)
+async def test_an_answer_cut_off_by_a_dropped_connection_or_a_timeout_keeps_its_text_and_gets_the_interrupted_notice(
+    pipe_instance_async, partial, notice, marker, failure
+) -> None:
+    """Once part of the answer has arrived, the text stays and the interrupted notice follows it, whether the
+    connection dropped or timed out (the user's decision, 2026-09-17). The request still ends as a failure."""
+    pipe = pipe_instance_async
+    pipe.valves.STREAM_INTERRUPTED_TEMPLATE = notice
+    pipe.valves.CONNECTION_ERROR_TEMPLATE = "### Unreachable host"
+    pipe.valves.NETWORK_TIMEOUT_TEMPLATE = "### Took too long"
+    pipe.valves.INTERNAL_ERROR_TEMPLATE = "### Something broke\n\nA {error_type} ended the turn."
+
+    async def source() -> Any:
+        yield {"type": "response.created", "response": {"model": MODEL}}
+        yield {"type": "response.output_item.added", "output_index": 0, "item": {"type": "message"}}
+        yield {"type": "response.output_text.delta", "output_index": 0, "delta": partial}
+        raise failure
+
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    outcome: dict[str, Any] = {}
+    returned = await pipe._streaming_handler._run_streaming_loop(
+        ResponsesBody(model=MODEL, input=[], stream=True),
+        pipe.valves,
+        _stream_emitter(pipe, queue),
+        {},
+        {},
+        session=cast(Any, _NoSession()),
+        user_id="u",
+        event_source=source(),
+        outcome_sink=outcome,
+    )
+    accumulated = _content(_drain(queue))
+
+    _assert_both_in_order(accumulated, partial, marker)
+    assert partial in cast(str, returned) and marker in cast(str, returned), returned
+    assert not any(other in accumulated for other in ("Unreachable host", "Took too long", "Something broke")), accumulated
+    assert outcome.get("error_occurred") is True, outcome
 
 
 # ---------------------------------------------------------------------------
@@ -464,3 +522,73 @@ async def test_a_phase_marker_on_the_wire_ends_the_attempt_rather_than_being_ret
     )
     assert accumulated.index(f"[P:{phase}]") < accumulated.index(marker)
     assert marker in returned, f"the non-streaming leg carries the card too. got {returned!r}"
+
+
+def _statuses(items: list[Any]) -> list[dict[str, Any]]:
+    """The progress lines the same turn sent, in order.
+
+    On the streaming leg a status travels wrapped as ``{"event": {...}}``, the out-of-band
+    envelope Open WebUI unpacks and re-emits; read it out of the queue rather than assuming
+    the raw emitter shape, which is not what reaches the browser.
+    """
+    statuses: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        wrapped = item.get("event")
+        event: dict[str, Any] = wrapped if isinstance(wrapped, dict) else item
+        data = event.get("data")
+        if event.get("type") == "status" and isinstance(data, dict):
+            statuses.append(data)
+    return statuses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "valve", "template", "marker"),
+    [
+        (
+            aiohttp.ClientConnectorError(MagicMock(ssl=None), OSError(111, "refused")),
+            "CONNECTION_ERROR_TEMPLATE",
+            "### Unreachable host",
+            "Unreachable host",
+        ),
+        (TimeoutError(), "NETWORK_TIMEOUT_TEMPLATE", "### Took too long", "Took too long"),
+    ],
+)
+async def test_a_failure_card_is_the_last_word_and_the_progress_line_stops_with_it(
+    pipe_instance_async, failure, valve, template, marker
+) -> None:
+    """A card saying the connection failed must not sit under a line still saying "Thinking…".
+
+    The progress line is only closed on the path that ends well, so a turn that ends in one of the
+    admin's failure messages leaves the last thing the person read describing work that is no longer
+    happening. It is stale rather than spinning, which is worse: it reads as though the pipe is still
+    trying.
+
+    Both arms end before any answer text, which is exactly when these two messages are shown.
+    """
+    pipe = pipe_instance_async
+    setattr(pipe.valves, valve, template)
+
+    async def source() -> Any:
+        yield {"type": "response.created", "response": {"model": MODEL}}
+        raise failure
+
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    await pipe._streaming_handler._run_streaming_loop(
+        ResponsesBody(model=MODEL, input=[], stream=True),
+        pipe.valves,
+        _stream_emitter(pipe, queue),
+        {},
+        {},
+        session=cast(Any, _NoSession()),
+        user_id="u",
+        event_source=source(),
+    )
+    items = _drain(queue)
+
+    assert marker in _content(items), _content(items)
+    statuses = _statuses(items)
+    assert statuses, "the turn emitted no status at all"
+    assert statuses[-1].get("done") is True, statuses

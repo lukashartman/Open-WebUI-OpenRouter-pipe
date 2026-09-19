@@ -1756,29 +1756,33 @@ async def test_chat_completions_streaming_reasoning_done_item(pipe_instance_asyn
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_streaming_breaker_open(pipe_instance_async):
-    """Test streaming with breaker open should raise RuntimeError."""
+async def test_a_tripped_breaker_does_not_stop_a_chat_stream_already_under_way(pipe_instance_async):
+    """The breaker refuses the user's next request at the pipe's entry; this stream reached the transport and runs on."""
     pipe = pipe_instance_async
     valves = pipe.valves
     session = pipe._create_http_session(valves)
 
-    # Simulate breaker being open by triggering failures
     breaker_key = "test_breaker_user"
-    # Record enough failures to open the breaker
     for _ in range(10):
         pipe._circuit_breaker.record_failure(breaker_key)
+    assert pipe._circuit_breaker.allows(breaker_key) is False, "the breaker was not open, so this proves nothing"
+
+    sse_response = (
+        _sse({"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]})
+        + _sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        + "data: [DONE]\n\n"
+    )
 
     with aioresponses() as mock_http:
-        # Mock won't be called because breaker is open
         mock_http.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            body=b"data: [DONE]\n\n",
+            body=sse_response.encode("utf-8"),
+            headers={"Content-Type": "text/event-stream"},
             status=200,
         )
 
-        # Try to make request with open breaker
-        try:
-            events = []
+        events = [
+            event
             async for event in pipe.send_openai_chat_completions_streaming_request(
                 session,
                 {"model": "openai/gpt-4o", "stream": True, "input": []},
@@ -1786,14 +1790,12 @@ async def test_chat_completions_streaming_breaker_open(pipe_instance_async):
                 base_url="https://openrouter.ai/api/v1",
                 valves=valves,
                 breaker_key=breaker_key,
-            ):
-                events.append(event)
-            # If breaker doesn't block, we should at least complete
-        except RuntimeError as e:
-            # Expected: breaker is open
-            assert "Breaker open" in str(e)
+            )
+        ]
 
         await session.close()
+
+    assert events, "the stream produced nothing, so the transport refused a request already under way"
 
 
 @pytest.mark.asyncio
@@ -2151,36 +2153,35 @@ async def test_chat_completions_nonstreaming_with_rate_limit_scope(pipe_instance
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_nonstreaming_breaker_open(pipe_instance_async):
-    """Test non-streaming with breaker open should raise RuntimeError."""
+async def test_a_tripped_breaker_does_not_stop_a_chat_request_already_under_way(pipe_instance_async):
+    """The same on the non-streaming chat transport: the call reaches OpenRouter and returns its answer."""
     pipe = pipe_instance_async
     valves = pipe.valves
     session = pipe._create_http_session(valves)
 
     breaker_key = "test_ns_breaker"
-    # Open the breaker by recording failures
     for _ in range(10):
         pipe._circuit_breaker.record_failure(breaker_key)
+    assert pipe._circuit_breaker.allows(breaker_key) is False, "the breaker was not open, so this proves nothing"
 
+    answered = {"id": "chat-1", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}}]}
     with aioresponses() as mock_http:
-        mock_http.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            payload={"choices": []},
-        )
+        mock_http.post("https://openrouter.ai/api/v1/chat/completions", payload=answered, status=200)
 
-        try:
-            await pipe.send_openai_chat_completions_nonstreaming_request(
-                session,
-                {"model": "openai/gpt-4o", "input": []},
-                api_key="test-key",
-                base_url="https://openrouter.ai/api/v1",
-                valves=valves,
-                breaker_key=breaker_key,
-            )
-        except RuntimeError as e:
-            assert "Breaker open" in str(e)
+        result = await pipe.send_openai_chat_completions_nonstreaming_request(
+            session,
+            {"model": "openai/gpt-4o", "input": []},
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            valves=valves,
+            breaker_key=breaker_key,
+        )
+        posts = sum(len(calls) for (method, _url), calls in mock_http.requests.items() if method == "POST")
 
         await session.close()
+
+    assert posts == 1, "the transport refused a request already under way"
+    assert isinstance(result, dict) and result, result
 
 
 @pytest.mark.asyncio
@@ -4024,7 +4025,7 @@ async def test_chat_completions_inlines_internal_file_urls(monkeypatch) -> None:
     with aioresponses() as mock_http:
         mock_http.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            body=b"data: [DONE]\n\n",
+            body=(_sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}) + "data: [DONE]\n\n").encode("utf-8"),
             headers={"Content-Type": "text/event-stream"},
             status=200,
         )
@@ -4473,7 +4474,7 @@ async def test_chat_completions_input_file_file_id_preinlined_to_file_data(monke
     with aioresponses() as mock_http:
         mock_http.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            body=b"data: [DONE]\n\n",
+            body=(_sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}) + "data: [DONE]\n\n").encode("utf-8"),
             headers={"Content-Type": "text/event-stream"},
             status=200,
             callback=capture_request,
@@ -4597,7 +4598,7 @@ async def test_chat_completions_preinline_threads_user(monkeypatch) -> None:
     with aioresponses() as mock_http:
         mock_http.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            body=b"data: [DONE]\n\n",
+            body=(_sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}) + "data: [DONE]\n\n").encode("utf-8"),
             headers={"Content-Type": "text/event-stream"},
             status=200,
         )

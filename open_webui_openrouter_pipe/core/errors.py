@@ -460,6 +460,25 @@ def _build_error_template_values(
     return replacements
 
 
+_BLOCKED_RATHER_THAN_REJECTED = frozenset({"content_policy_violation", "refusal", "permission_denied"})
+_BLOCKED_NATIVE_CODES = frozenset({"image_content_policy_violation"})
+
+
+def is_sign_in_failure(exc: Any) -> bool:
+    status = getattr(exc, "status", None)
+    if status == 401:
+        return True
+    if status != 403:
+        return False
+    kind = (getattr(exc, "openrouter_error_type", None) or "").strip().lower()
+    if kind:
+        return kind not in _BLOCKED_RATHER_THAN_REJECTED
+    code = getattr(exc, "openrouter_code", None)
+    if isinstance(code, str) and code.strip().lower() in _BLOCKED_NATIVE_CODES:
+        return False
+    return not (getattr(exc, "moderation_reasons", None) or getattr(exc, "flagged_input", None))
+
+
 def _resolve_error_model_context(
     error: OpenRouterAPIError,
     *,

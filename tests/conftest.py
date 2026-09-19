@@ -126,6 +126,7 @@ def _maybe_install_bundled_pipe() -> None:
 _maybe_install_bundled_pipe()
 
 from open_webui_openrouter_pipe import Pipe
+from open_webui_openrouter_pipe.core.circuit_breaker import CircuitBreaker
 from open_webui_openrouter_pipe.models.registry import OpenRouterModelRegistry, ModelFamily
 
 
@@ -343,6 +344,20 @@ def _reset_stub_chat_files():
     store = getattr(chats, "_chat_files", None)
     if store is not None:
         store.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_failure_state():
+    """Clear the auth-failure pause, which is class state with a 60-second life.
+
+    Rendering a sign-in-failure card records the pause for every pipe instance in the
+    process, and while it holds, task-model calls are skipped. Without this reset a
+    test that renders such a card silently changes what a later test's background
+    task returns -- a title test reads the fallback title and fails, far from the
+    test that caused it.
+    """
+    CircuitBreaker._AUTH_FAILURE_UNTIL.clear()
     yield
 
 

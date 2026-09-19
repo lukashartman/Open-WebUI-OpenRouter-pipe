@@ -34,6 +34,17 @@ class _Emitter:
     async def __call__(self, event: dict[str, Any]) -> None:
         self.events.append(event)
 
+    @property
+    def card(self) -> str:
+        """The failure card's text, found by kind rather than by position.
+
+        A failing turn also stops the progress line, so the card is not the first thing
+        emitted; these tests are about what the card says, not about where it lands.
+        """
+        cards = [event for event in self.events if event.get("type") == "chat:message"]
+        assert len(cards) == 1, f"expected exactly one card, got {[e.get('type') for e in self.events]}"
+        return cards[0]["data"]["content"]
+
 
 @pytest.fixture
 def mock_event_emitter():
@@ -54,10 +65,9 @@ class TestEmitTemplatedError:
         )
 
         # Should emit chat message and completion
-        assert len(mock_event_emitter.events) == 2
-        assert mock_event_emitter.events[0]["type"] == "chat:message"
-        assert "Test Error" in mock_event_emitter.events[0]["data"]["content"]
-        assert "Test message" in mock_event_emitter.events[0]["data"]["content"]
+        assert len(mock_event_emitter.events) == 3
+        assert "Test Error" in mock_event_emitter.card
+        assert "Test message" in mock_event_emitter.card
 
     @pytest.mark.asyncio
     async def test_error_id_generation(self, mock_pipe, mock_event_emitter):
@@ -69,7 +79,7 @@ class TestEmitTemplatedError:
             log_message="Test",
         )
 
-        content = mock_event_emitter.events[0]["data"]["content"]
+        content = mock_event_emitter.card
         assert "Error ID:" in content
         # Error ID should be 16 hex characters
         error_id = content.split("Error ID:")[-1].strip()
@@ -93,7 +103,7 @@ class TestEmitTemplatedError:
             log_message="Test",
         )
 
-        content = mock_event_emitter.events[0]["data"]["content"]
+        content = mock_event_emitter.card
         assert "Detail: Important detail" in content
         assert "This should not appear" not in content
 
@@ -107,7 +117,7 @@ class TestEmitTemplatedError:
             log_message="Test",
         )
 
-        content = mock_event_emitter.events[0]["data"]["content"]
+        content = mock_event_emitter.card
         assert "support@example.com" in content
 
     @pytest.mark.asyncio
@@ -120,7 +130,7 @@ class TestEmitTemplatedError:
             log_message="Test",
         )
 
-        content = mock_event_emitter.events[0]["data"]["content"]
+        content = mock_event_emitter.card
         assert "Time: " in content
         # Should be ISO 8601 format with Z suffix
         assert "Z" in content
@@ -167,8 +177,8 @@ class TestNetworkTimeoutError:
                         session=session,
                     )
 
-        assert len(mock_event_emitter.events) == 2
-        content = mock_event_emitter.events[0]["data"]["content"]
+        assert len(mock_event_emitter.events) == 3
+        content = mock_event_emitter.card
         assert result == content
         assert "⏱️" in content or "Timeout" in content
         assert "Error ID:" in content
@@ -215,8 +225,8 @@ class TestConnectionError:
                         session=session,
                     )
 
-        assert len(mock_event_emitter.events) == 2
-        content = mock_event_emitter.events[0]["data"]["content"]
+        assert len(mock_event_emitter.events) == 3
+        content = mock_event_emitter.card
         assert result == content
         assert "Connection" in content or "🔌" in content
         assert "Error ID:" in content
@@ -269,8 +279,8 @@ class TestServiceError:
                         session=session,
                     )
 
-        assert len(mock_event_emitter.events) == 2
-        content = mock_event_emitter.events[0]["data"]["content"]
+        assert len(mock_event_emitter.events) == 3
+        content = mock_event_emitter.card
         assert result == content
         assert "Service Error" in content or "502" in content
         assert "Error ID:" in content
@@ -522,8 +532,8 @@ class TestInternalError:
                         session=session,
                     )
 
-        assert len(mock_event_emitter.events) == 2
-        content = mock_event_emitter.events[0]["data"]["content"]
+        assert len(mock_event_emitter.events) == 3
+        content = mock_event_emitter.card
         assert result == content
         assert "Unexpected" in content or "⚠️" in content
         assert "Error ID:" in content
@@ -573,7 +583,7 @@ class TestTemplateCustomization:
                         session=session,
                     )
 
-        content = mock_event_emitter.events[0]["data"]["content"]
+        content = mock_event_emitter.card
         assert "Custom error" in content
         assert "RuntimeError" in content
 
@@ -1993,6 +2003,77 @@ def test_openrouters_typed_error_code_is_read_from_the_place_each_transport_puts
 
     error = _build_openrouter_api_error(400, "Bad Request", body)
     assert error.openrouter_error_type == expected_type
+
+
+@pytest.mark.parametrize(
+    "event, expected_type",
+    [
+        pytest.param(
+            {
+                "id": "gen-1",
+                "object": "chat.completion.chunk",
+                "error": {
+                    "code": 400,
+                    "message": "This request exceeds the model's window.",
+                    "metadata": {"error_type": "context_length_exceeded"},
+                },
+            },
+            "context_length_exceeded",
+            id="chat-metadata-error-type",
+        ),
+        pytest.param(
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-1",
+                    "status": "failed",
+                    "error": {"code": "invalid_prompt", "message": "This request is too long."},
+                    "error_type": "context_length_exceeded",
+                },
+            },
+            "context_length_exceeded",
+            id="responses-top-level-error-type",
+        ),
+        pytest.param(
+            {
+                "id": "gen-2",
+                "object": "chat.completion.chunk",
+                "error": {"code": 502, "message": "Provider disconnected unexpectedly."},
+            },
+            None,
+            id="no-typed-code-published",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_failure_reported_inside_a_started_reply_carries_openrouters_typed_code(event, expected_type):
+    """The same typed code decides the model-limits block whether OpenRouter rejects or reports mid-reply.
+
+    A context overflow can arrive either way: as a rejection, or inside a reply OpenRouter has already
+    committed with ``200 OK``. The rejection path is covered by the table above. This one drives the
+    in-band builder, whose messages deliberately avoid both remedy phrases, so only the typed code can
+    open the block. Each message here names no remedy, so a builder that drops the typed code shows the
+    person an overflow card with no window size on it.
+    """
+    from open_webui_openrouter_pipe import Pipe
+    from open_webui_openrouter_pipe.core.errors import _build_error_template_values
+
+    pipe = Pipe()
+    try:
+        error = pipe._ensure_error_formatter()._build_streaming_openrouter_error(event, requested_model="m1")
+        assert error.openrouter_error_type == expected_type
+        values = _build_error_template_values(
+            error,
+            heading="Anthropic: anthropic/claude-3",
+            diagnostics=[],
+            metrics={"context_limit": 400000, "max_output_tokens": 128000},
+            model_identifier="anthropic/claude-3",
+            normalized_model_id="anthropic.claude-3",
+            api_model_id="anthropic/claude-3",
+        )
+        assert values["include_model_limits"] is (expected_type is not None)
+    finally:
+        await pipe.close()
 
 
 def test_the_provider_type_and_openrouters_type_stay_separate_fields():

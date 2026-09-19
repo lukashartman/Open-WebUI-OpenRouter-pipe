@@ -56,7 +56,11 @@ from ..transforms import (
     _parse_url_citation_annotations,
     _responses_payload_to_chat_completions_payload,
 )
-from .responses_adapter import _should_retry_stream
+from .responses_adapter import (
+    _count_failed_call,
+    _record_failed_call,
+    _should_retry_stream,
+)
 
 if TYPE_CHECKING:
     from ...pipe import Pipe
@@ -175,6 +179,7 @@ class ChatCompletionsAdapter:
         tool_calls_by_index: dict[int, dict[str, Any]] = {}
         tool_call_added: set[int] = set()
         tool_calls_completed = False
+        cut_off = False
         assistant_text_parts: list[str] = []
         latest_usage: dict[str, Any] = {}
         seen_citation_urls: set[str] = set()
@@ -281,18 +286,15 @@ class ChatCompletionsAdapter:
         first_chunk_received = False
         async for attempt in retryer:
             with attempt:
-                if breaker_key and not self._pipe._circuit_breaker.allows(breaker_key):
-                    raise RuntimeError("Breaker open for user during stream")
-
                 await self._inline_internal_chat_files(chat_payload, effective_valves, user=user)
 
                 timing_mark("chat_http_request_start")
-                async with session.post(url, json=chat_payload, headers=headers) as resp:
+                async with _count_failed_call(self._pipe, breaker_key), session.post(
+                    url, json=chat_payload, headers=headers
+                ) as resp:
                     timing_mark("chat_http_headers_received")
                     if resp.status >= 400:
                         error_body = await _debug_print_error_response(resp, logger=self.logger)
-                        if breaker_key:
-                            self._pipe._circuit_breaker.record_failure(breaker_key)
                         extra_meta: dict[str, Any] = {}
                         _apply_retry_after_metadata(extra_meta, resp.headers)
                         rate_scope = (
@@ -357,6 +359,11 @@ class ChatCompletionsAdapter:
                                     )
                                     continue
                                 emitted_any = True
+                                reported_error = self._pipe._ensure_error_formatter()._extract_streaming_error_event(
+                                    chunk_obj, chat_payload.get("model")
+                                )
+                                if reported_error is not None:
+                                    raise reported_error
 
                                 if isinstance(chunk_obj, dict) and isinstance(chunk_obj.get("usage"), dict):
                                     latest_usage = dict(chunk_obj["usage"])
@@ -589,7 +596,15 @@ class ChatCompletionsAdapter:
                             del buf[:start_idx]
                         if done:
                             break
+                    if not emitted_any:
+                        raise aiohttp.ClientPayloadError("OpenRouter closed the stream before sending anything")
+                    if not done and not tool_calls_completed:
+                        _record_failed_call(self._pipe, breaker_key)
+                        cut_off = True
                     break
+
+        if cut_off:
+            return
 
         if reasoning_item_id is not None:
             reasoning_text = "".join(reasoning_text_parts).strip()
@@ -729,18 +744,15 @@ class ChatCompletionsAdapter:
 
         async for attempt in retryer:
             with attempt:
-                if breaker_key and not self._pipe._circuit_breaker.allows(breaker_key):
-                    raise RuntimeError("Breaker open for user during request")
-
                 await self._inline_internal_chat_files(chat_payload, effective_valves, user=user)
 
                 timing_mark("chat_nonstream_http_request_start")
-                async with session.post(url, json=chat_payload, headers=headers) as resp:
+                async with _count_failed_call(self._pipe, breaker_key), session.post(
+                    url, json=chat_payload, headers=headers
+                ) as resp:
                     timing_mark("chat_nonstream_http_response")
                     if resp.status >= 400:
                         error_body = await _debug_print_error_response(resp, logger=self.logger)
-                        if breaker_key:
-                            self._pipe._circuit_breaker.record_failure(breaker_key)
                         extra_meta: dict[str, Any] = {}
                         _apply_retry_after_metadata(extra_meta, resp.headers)
                         rate_scope = (
@@ -771,6 +783,11 @@ class ChatCompletionsAdapter:
                             raise RuntimeError("Invalid JSON response from /chat/completions") from exc
                     if isinstance(data, dict):
                         _debug_print_response(data, logger=self.logger)
+                        reported_error = self._pipe._ensure_error_formatter()._extract_streaming_error_event(
+                            data, chat_payload.get("model")
+                        )
+                        if reported_error is not None:
+                            raise reported_error
                         return data
                     _debug_print_response(data, logger=self.logger)
                     return {}
@@ -818,7 +835,7 @@ class ChatCompletionsAdapter:
                 return True
             if etype.startswith("response.reasoning"):
                 return True
-            return etype in {"response.completed", "response.failed", "response.error", "error"}
+            return etype in {"response.completed", "response.incomplete", "response.failed", "response.error", "error"}
 
         responses_emitted_user_visible = False
         responses_buffer: list[dict[str, Any]] = []

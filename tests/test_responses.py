@@ -467,8 +467,13 @@ async def test_responses_streaming_error_4xx_non_special(pipe_instance_async):
 
 
 @pytest.mark.asyncio
-async def test_responses_streaming_breaker_open_at_start(pipe_instance_async):
-    """Test breaker open check at start of stream (line 112)."""
+async def test_a_tripped_breaker_does_not_stop_a_stream_already_under_way(pipe_instance_async):
+    """The breaker refuses a user's NEXT request, at the pipe's entry; a request that reached the transport runs on.
+
+    Until this rule the transport re-checked the breaker before each attempt and on every chunk it read, so a user
+    whose earlier calls had filled the count lost this answer too, and read an unexpected-error card instead of the
+    retry-later notice. The body below spans several chunk reads, so a per-chunk check could not pass it either.
+    """
     pipe = pipe_instance_async
     valves = pipe.valves
     session = pipe._create_http_session(valves)
@@ -476,28 +481,36 @@ async def test_responses_streaming_breaker_open_at_start(pipe_instance_async):
     test_user_id = "test-breaker-user"
     for _ in range(20):
         pipe._circuit_breaker.record_failure(test_user_id)
+    assert pipe._circuit_breaker.allows(test_user_id) is False, "the breaker was not open, so this proves nothing"
+
+    deltas = [f"part-{index} " + "x" * 200 for index in range(40)]
+    body = "".join(_sse({"type": "response.output_text.delta", "delta": delta}) for delta in deltas)
+    body += _sse({"type": "response.completed", "response": {"id": "resp-1", "output": []}}) + "data: [DONE]\n\n"
+    assert len(body.encode("utf-8")) > 8192, "the body must be longer than one chunk read"
 
     with aioresponses() as mock_http:
         mock_http.post(
             "https://openrouter.ai/api/v1/responses",
-            body=b"",
+            body=body.encode("utf-8"),
+            headers={"Content-Type": "text/event-stream"},
             status=200,
         )
 
-        with pytest.raises(RuntimeError) as exc_info:
-            async for _ in pipe.send_openai_responses_streaming_request(
+        events = [
+            event
+            async for event in pipe.send_openai_responses_streaming_request(
                 session,
                 {"model": "openai/gpt-4o", "stream": True, "input": []},
                 api_key="test-key",
                 base_url="https://openrouter.ai/api/v1",
                 valves=valves,
                 breaker_key=test_user_id,
-            ):
-                pass
+            )
+        ]
 
         await session.close()
 
-    assert "Breaker open" in str(exc_info.value)
+    assert [event.get("delta") for event in events if event.get("type") == "response.output_text.delta"] == deltas
 
 
 @pytest.mark.asyncio
@@ -941,37 +954,33 @@ async def test_responses_nonstreaming_error_4xx_generic(pipe_instance_async):
 
 
 @pytest.mark.asyncio
-async def test_responses_nonstreaming_breaker_open(pipe_instance_async):
-    """Test non-streaming breaker open check (line 449)."""
+async def test_a_tripped_breaker_does_not_stop_a_non_streaming_request_already_under_way(pipe_instance_async):
+    """The same rule on the non-streaming transport: the request that reached it completes and returns its payload."""
     pipe = pipe_instance_async
     valves = pipe.valves
     session = pipe._create_http_session(valves)
 
-    # Force breaker to be open
     test_user_id = "test-nonstream-breaker"
     for _ in range(20):
         pipe._circuit_breaker.record_failure(test_user_id)
+    assert pipe._circuit_breaker.allows(test_user_id) is False, "the breaker was not open, so this proves nothing"
 
+    answered = {"id": "resp-1", "output": [{"type": "message", "role": "assistant", "content": []}]}
     with aioresponses() as mock_http:
-        mock_http.post(
-            "https://openrouter.ai/api/v1/responses",
-            payload={},
-            status=200,
-        )
+        mock_http.post("https://openrouter.ai/api/v1/responses", payload=answered, status=200)
 
-        with pytest.raises(RuntimeError) as exc_info:
-            await pipe.send_openai_responses_nonstreaming_request(
-                session,
-                {"model": "openai/gpt-4o", "input": []},
-                api_key="test-key",
-                base_url="https://openrouter.ai/api/v1",
-                valves=valves,
-                breaker_key=test_user_id,
-            )
+        payload = await pipe.send_openai_responses_nonstreaming_request(
+            session,
+            {"model": "openai/gpt-4o", "input": []},
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            valves=valves,
+            breaker_key=test_user_id,
+        )
 
         await session.close()
 
-    assert "Breaker open" in str(exc_info.value)
+    assert payload == answered
 
 
 @pytest.mark.asyncio

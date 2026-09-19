@@ -313,12 +313,11 @@ async def test_emit_templated_error_event_basic(event_handler):
         log_message="Test error occurred",
     )
 
-    # Should emit chat:message and chat:completion
-    assert len(emitted) == 2
-    assert emitted[0]["type"] == "chat:message"
-    assert "Something went wrong" in emitted[0]["data"]["content"]
-    assert emitted[1]["type"] == "chat:completion"
-    assert emitted[1]["data"]["done"] is True
+    # Should stop the progress line, then emit chat:message and chat:completion
+    assert [event["type"] for event in emitted] == ["status", "chat:message", "chat:completion"]
+    assert emitted[0]["data"]["done"] is True
+    assert "Something went wrong" in emitted[1]["data"]["content"]
+    assert emitted[2]["data"]["done"] is True
 
 
 @pytest.mark.asyncio
@@ -356,8 +355,8 @@ async def test_emit_templated_error_event_template_rendering_fails(event_handler
         )
 
     # Should emit fallback error message
-    assert len(emitted) == 2
-    assert "couldn't format the error message" in emitted[0]["data"]["content"]
+    assert [event["type"] for event in emitted] == ["status", "chat:message", "chat:completion"]
+    assert "couldn't format the error message" in emitted[1]["data"]["content"]
 
 
 @pytest.mark.asyncio

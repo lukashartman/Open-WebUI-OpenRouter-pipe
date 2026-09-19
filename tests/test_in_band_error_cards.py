@@ -1,0 +1,233 @@
+"""Which message a person reads when OpenRouter reports a failure inside a reply it has already started.
+
+OpenRouter commits `200 OK` as soon as a provider accepts a request, so every later failure — a rate limit, an
+overloaded or unreachable provider, a provider timeout, an exhausted balance — arrives inside the reply carrying its
+own code (`api_reference/errors-and-debugging.md`). The user's decision (2026-09-18): the pipe reads that code and
+shows the message for that kind of failure, keeping the rejected-request message for codes it does not recognise.
+
+Every message template is replaced by its own marker, so each arm shows which of the admin's messages was chosen, and
+the requests go through ``pipe.pipe()`` and the real transports.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+from aioresponses import aioresponses
+
+from open_webui_openrouter_pipe import Pipe
+
+_RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
+_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+_MARKERS = {
+    "OPENROUTER_ERROR_TEMPLATE": "### REJECTED-CARD",
+    "RATE_LIMIT_TEMPLATE": "### RATE-LIMIT-CARD",
+    "SERVICE_ERROR_TEMPLATE": "### SERVICE-CARD",
+    "SERVER_TIMEOUT_TEMPLATE": "### SERVER-TIMEOUT-CARD",
+    "AUTHENTICATION_ERROR_TEMPLATE": "### AUTH-CARD",
+    "INSUFFICIENT_CREDITS_TEMPLATE": "### CREDITS-CARD",
+    "INTERNAL_ERROR_TEMPLATE": "### UNEXPECTED-CARD",
+}
+
+
+def _pipe_reaching_the_model(monkeypatch, endpoint: str) -> Pipe:
+    import open_webui_openrouter_pipe.pipe as pipe_mod
+
+    async def loaded(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    pipe = Pipe()
+    monkeypatch.setattr(pipe, "_resolve_openrouter_api_key", lambda _valves: ("sk-test-key", None))
+    monkeypatch.setattr(pipe._artifact_store, "_ensure_artifact_store", lambda *_a, **_k: None)
+    monkeypatch.setattr(pipe_mod.OpenRouterModelRegistry, "ensure_loaded", loaded)
+    monkeypatch.setattr(
+        pipe_mod.OpenRouterModelRegistry, "list_models", lambda: [{"id": "m1", "name": "Model m1", "norm_id": "m1"}]
+    )
+    pipe.valves = pipe.valves.model_copy(update={"DEFAULT_LLM_ENDPOINT": endpoint, **_MARKERS})
+    return pipe
+
+
+async def _turn(pipe: Pipe, *, stream: bool) -> str:
+    result = await pipe.pipe(
+        body={"model": "m1", "messages": [{"role": "user", "content": "Look it up."}], "stream": stream},
+        __user__={"id": "user-1", "role": "user"},
+        __request__=None,
+        __event_emitter__=None,
+        __event_call__=None,
+        __metadata__={"chat_id": "chat-1", "message_id": "message-1", "model": {"id": "m1"}},
+        __tools__=None,
+    )
+    if isinstance(result, AsyncIterator):
+        return "".join([str(chunk) async for chunk in result])
+    return str(result)
+
+
+def _cards(reply: str) -> list[str]:
+    return [name for name, marker in _MARKERS.items() if marker in reply]
+
+
+def _sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _chat_stream(code: Any, error_type: str) -> bytes:
+    chunk = {
+        "id": "gen-1", "object": "chat.completion.chunk", "created": 1, "model": "m1", "provider": "P",
+        "error": {"code": code, "message": "reported inside the reply", "metadata": {"error_type": error_type}},
+        "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}],
+    }
+    return (_sse(chunk) + "data: [DONE]\n\n").encode("utf-8")
+
+
+def _chat_body(code: Any, error_type: str) -> bytes:
+    body = {"error": {"code": code, "message": "reported inside the reply", "metadata": {"error_type": error_type}}}
+    return json.dumps(body).encode("utf-8")
+
+
+def _responses_stream(code: str, error_type: str) -> bytes:
+    event = {
+        "type": "response.failed",
+        "response": {"id": "resp-1", "status": "failed", "error": {"code": code, "message": "reported inside the reply"},
+                     "error_type": error_type},
+    }
+    return (_sse(event) + "data: [DONE]\n\n").encode("utf-8")
+
+
+def _chat_stream_native(code: str) -> bytes:
+    """The shape `api_reference/streaming.md` documents: a native code and no typed kind."""
+    chunk = {
+        "id": "cmpl-abc123", "object": "chat.completion.chunk", "created": 1, "model": "m1", "provider": "openai",
+        "error": {"code": code, "message": "Provider disconnected unexpectedly"},
+        "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}],
+    }
+    return (_sse(chunk) + "data: [DONE]\n\n").encode("utf-8")
+
+
+def _responses_error_event(event_type: str, code: str) -> bytes:
+    event = {"type": event_type, "error": {"code": code, "message": "reported inside the reply"}}
+    return (_sse(event) + "data: [DONE]\n\n").encode("utf-8")
+
+
+def _responses_body(code: str, error_type: str) -> bytes:
+    body = {"id": "resp-1", "status": "failed", "error": {"code": code, "message": "reported inside the reply"},
+            "error_type": error_type}
+    return json.dumps(body).encode("utf-8")
+
+
+# Each arm: the endpoint, whether the turn streams, the reply body, and the message the person must read.
+_ARMS: dict[str, tuple[str, bool, bytes, str]] = {
+    "chat-stream-rate-limit": ("chat_completions", True, _chat_stream(429, "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE"),
+    "chat-stream-provider-unavailable": ("chat_completions", True, _chat_stream(502, "provider_unavailable"), "SERVICE_ERROR_TEMPLATE"),
+    "chat-stream-provider-overloaded": ("chat_completions", True, _chat_stream(503, "provider_overloaded"), "SERVICE_ERROR_TEMPLATE"),
+    "chat-stream-provider-timed-out": ("chat_completions", True, _chat_stream(504, "timeout"), "SERVICE_ERROR_TEMPLATE"),
+    "chat-stream-invalid-request": ("chat_completions", True, _chat_stream(400, "invalid_request"), "OPENROUTER_ERROR_TEMPLATE"),
+    "chat-body-out-of-credits": ("chat_completions", False, _chat_body(402, "payment_required"), "INSUFFICIENT_CREDITS_TEMPLATE"),
+    "responses-stream-rate-limit": ("responses", True, _responses_stream("rate_limit_exceeded", "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE"),
+    "responses-stream-server-error": ("responses", True, _responses_stream("server_error", "server"), "SERVICE_ERROR_TEMPLATE"),
+    "responses-stream-invalid-prompt": ("responses", True, _responses_stream("invalid_prompt", "invalid_request"), "OPENROUTER_ERROR_TEMPLATE"),
+    "responses-body-authentication": ("responses", False, _responses_body("server_error", "authentication"), "AUTHENTICATION_ERROR_TEMPLATE"),
+    "chat-stream-provider-disconnected": ("chat_completions", True, _chat_stream_native("server_error"), "SERVICE_ERROR_TEMPLATE"),
+    "chat-stream-kind-the-pipe-does-not-know": ("chat_completions", True, _chat_stream(429, "quota_exhausted"), "RATE_LIMIT_TEMPLATE"),
+    "responses-stream-error-event-rate-limit": ("responses", True, _responses_error_event("response.error", "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE"),
+    "responses-stream-error-event-invalid-key": ("responses", True, _responses_error_event("error", "invalid_api_key"), "AUTHENTICATION_ERROR_TEMPLATE"),
+    "responses-stream-error-event-blocked-image": ("responses", True, _responses_error_event("response.error", "image_content_policy_violation"), "OPENROUTER_ERROR_TEMPLATE"),
+    "responses-stream-error-event-unknown-code": ("responses", True, _responses_error_event("error", "wolves_ate_the_response"), "OPENROUTER_ERROR_TEMPLATE"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", list(_ARMS))
+async def test_a_failure_reported_inside_a_started_reply_shows_the_message_for_that_failure(monkeypatch, arm):
+    endpoint, stream, body, expected = _ARMS[arm]
+    pipe = _pipe_reaching_the_model(monkeypatch, endpoint)
+    try:
+        with aioresponses() as mock_http:
+            mock_http.post(_RESPONSES_URL if endpoint == "responses" else _CHAT_URL, status=200, body=body, repeat=True)
+            reply = await _turn(pipe, stream=stream)
+    finally:
+        await pipe.close()
+
+    assert _cards(reply) == [expected], reply
+
+
+# ---------------------------------------------------------------------------
+# what the card carries, and what the failure does to the rest of the session
+# ---------------------------------------------------------------------------
+
+
+_MODERATION_METADATA = {
+    "error_type": "content_policy_violation",
+    "reasons": ["hate", "violence"],
+    "flagged_input": "the exact words that were flagged",
+    "provider_name": "Google",
+    "model_slug": "google/gemini-3-pro",
+}
+_RATE_LIMIT_METADATA = {
+    "error_type": "rate_limit_exceeded",
+    "rate_limit_type": "per-minute",
+    "provider_name": "OpenAI",
+}
+
+
+def _rendered_values(error: Any) -> dict[str, Any]:
+    from open_webui_openrouter_pipe.core.errors import _build_error_template_values
+
+    return _build_error_template_values(
+        error,
+        heading="Provider: m1",
+        diagnostics=[],
+        metrics={},
+        model_identifier="m1",
+        normalized_model_id="m1",
+        api_model_id="m1",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata, shown",
+    [
+        pytest.param(
+            _MODERATION_METADATA,
+            {
+                "moderation_reasons": "- hate\n- violence",
+                "flagged_excerpt": "the exact words that were flagged",
+                "provider": "Google",
+            },
+            id="a-content-block-says-why",
+        ),
+        pytest.param(
+            _RATE_LIMIT_METADATA,
+            {"rate_limit_type": "per-minute", "provider": "OpenAI"},
+            id="a-rate-limit-says-which-limit",
+        ),
+    ],
+)
+async def test_a_card_says_the_same_thing_whether_the_failure_arrived_as_a_status_or_inside_a_reply(metadata, shown):
+    """OpenRouter sends the same `error.metadata` both ways, so the card must not lose it one way.
+
+    A provider reports a content block after OpenRouter has already committed `200 OK`, which is the
+    delivery the built-in rejected-request message's moderation rows exist for. Reading that block only
+    for its typed kind and discarding the rest left those rows empty exactly when they matter, while the
+    same body returned as a rejection filled them.
+
+    Each arm asserts the rendered values, not the presence of the words: the whole event is also dumped
+    into the raw-JSON placeholder, so a substring check would pass against the defect.
+    """
+    from open_webui_openrouter_pipe.core.errors import _build_openrouter_api_error
+
+    body = {"error": {"code": 403, "message": "This request was declined.", "metadata": metadata}}
+    rejected = _build_openrouter_api_error(403, "Forbidden", json.dumps(body))
+    pipe = Pipe()
+    try:
+        in_band = pipe._ensure_error_formatter()._build_streaming_openrouter_error(body, requested_model="m1")
+    finally:
+        await pipe.close()
+
+    rejected_values, in_band_values = _rendered_values(rejected), _rendered_values(in_band)
+    for name, expected in shown.items():
+        assert rejected_values[name] == expected, (name, "as a rejection")
+        assert in_band_values[name] == expected, (name, "inside a reply")

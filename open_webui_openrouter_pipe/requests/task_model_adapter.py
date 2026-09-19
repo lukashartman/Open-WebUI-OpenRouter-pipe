@@ -18,7 +18,7 @@ from ..api.transforms import (
 )
 from ..core.config import EncryptedStr
 from ..core.costs import maybe_dump_costs_snapshot
-from ..core.errors import OpenRouterAPIError
+from ..core.errors import OpenRouterAPIError, is_sign_in_failure
 from ..core.logging_system import SessionLogger
 from ..core.timing_logger import timed
 from ..models.registry import OpenRouterModelRegistry
@@ -195,10 +195,7 @@ class TaskModelAdapter:
 
             except Exception as exc:
                 last_error = exc
-                is_auth_failure = (
-                    isinstance(exc, OpenRouterAPIError)
-                    and getattr(exc, "status", None) in {401, 403}
-                )
+                is_auth_failure = isinstance(exc, OpenRouterAPIError) and is_sign_in_failure(exc)
                 if is_auth_failure:
                     self._pipe._note_auth_failure()
                 self.logger.warning(

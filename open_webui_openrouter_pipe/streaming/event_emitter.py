@@ -297,6 +297,10 @@ class EventEmitterHandler:
 
         try:
             await event_emitter({
+                "type": "status",
+                "data": {"description": "The request could not be completed. See details below.", "done": True},
+            })
+            await event_emitter({
                 "type": "chat:message",
                 "data": {"content": shown}
             })

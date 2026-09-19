@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from ..pipe import Pipe
     from ..streaming.event_emitter import EventEmitter, EventEmitterHandler
 
-from .errors import _resolve_error_model_context
+from .errors import _resolve_error_model_context, is_sign_in_failure
 from .utils import _pretty_json, _resolve_retry_after_seconds, join_answer_and_card
 
 # Simple fallback template used when no valve template is available.
@@ -47,6 +47,53 @@ _DEFAULT_USAGE_STATUS_ICONS: tuple[str, ...] = (
     "▽",  # reasoning tokens
 )
 _USAGE_ICON_FIELDS = ("time", "cost", "total", "input", "output", "cached", "reasoning")
+
+
+_IN_BAND_STATUS_BY_ERROR_TYPE = {
+    "authentication": 401,
+    "payment_required": 402,
+    "permission_denied": 403,
+    "content_policy_violation": 403,
+    "refusal": 403,
+    "not_found": 404,
+    "image_not_found": 404,
+    "precondition_failed": 412,
+    "payload_too_large": 413,
+    "unprocessable": 422,
+    "rate_limit_exceeded": 429,
+    "server": 500,
+    "unmapped": 500,
+    "provider_unavailable": 502,
+    "provider_overloaded": 503,
+    "timeout": 504,
+}
+
+
+_IN_BAND_STATUS_BY_NATIVE_CODE = {
+    "invalid_api_key": 401,
+    "image_content_policy_violation": 403,
+    "server_error": 500,
+}
+
+def _in_band_status(code: Any, error_type: str) -> int:
+    named_code = code.strip().lower() if isinstance(code, str) else ""
+    for table, named in (
+        (_IN_BAND_STATUS_BY_ERROR_TYPE, error_type.strip().lower()),
+        (_IN_BAND_STATUS_BY_ERROR_TYPE, named_code),
+        (_IN_BAND_STATUS_BY_NATIVE_CODE, named_code),
+    ):
+        status = table.get(named)
+        if status is not None:
+            return status
+    if isinstance(code, int) and not isinstance(code, bool):
+        numeric = code
+    elif isinstance(code, str) and code.strip().isdigit():
+        numeric = int(code.strip())
+    else:
+        numeric = None
+    if numeric is not None and 400 <= numeric <= 599:
+        return numeric
+    return 400
 
 
 class ErrorFormatter:
@@ -172,7 +219,10 @@ class ErrorFormatter:
         chunk_created = event.get("created") or response_block.get("created")
         chunk_model = event.get("model") or response_block.get("model")
         chunk_provider = event.get("provider") or response_block.get("provider")
+        error_metadata_value = error_block.get("metadata") if isinstance(error_block, dict) else None
+        error_metadata: dict[str, Any] = error_metadata_value if isinstance(error_metadata_value, dict) else {}
         metadata: dict[str, Any] = {
+            **error_metadata,
             "stream_event_type": event.get("type") or "",
             "raw": event,
         }
@@ -183,21 +233,27 @@ class ErrorFormatter:
                 metadata["response_error"] = response_block.get("error")
             if response_block.get("id"):
                 metadata.setdefault("request_id", response_block.get("id"))
+        error_type = str(error_metadata.get("error_type") or "")
+        if not error_type and isinstance(error_block, dict):
+            error_type = str(error_block.get("error_type") or "")
+        if not error_type:
+            error_type = str(event.get("error_type") or response_block.get("error_type") or "")
         raw_body = _pretty_json(event)
         return OpenRouterAPIError(
-            status=400,
+            status=_in_band_status(code, error_type),
+            openrouter_error_type=error_type or None,
             reason=message,
-            provider=chunk_provider,
+            provider=chunk_provider or error_metadata.get("provider_name"),
             openrouter_message=message,
             openrouter_code=code,
             upstream_message=message,
-            upstream_type=(code or event.get("type") or "stream_error"),
+            upstream_type=(str(code) if code is not None else "") or event.get("type") or "stream_error",
             request_id=response_block.get("id") or event.get("response_id") or event.get("request_id"),
             raw_body=raw_body,
             metadata=metadata,
-            moderation_reasons=None,
-            flagged_input=None,
-            model_slug=chunk_model,
+            moderation_reasons=[str(reason) for reason in error_metadata.get("reasons") or [] if reason],
+            flagged_input=error_metadata.get("flagged_input"),
+            model_slug=chunk_model or error_metadata.get("model_slug"),
             requested_model=requested_model,
             metadata_json=_pretty_json(metadata),
             provider_raw=event,
@@ -252,7 +308,7 @@ class ErrorFormatter:
         partial_answer: str = "",
     ) -> str:
         """Emit a user-facing markdown message for OpenRouter 400 responses."""
-        if getattr(exc, "status", None) in {401, 403}:
+        if is_sign_in_failure(exc):
             self._pipe._note_auth_failure()
         error_id, context_defaults = self._build_error_context()
         template_to_use = self._select_openrouter_template(exc.status)
