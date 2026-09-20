@@ -551,3 +551,35 @@ def retry_backoff():
         yield waited
     finally:
         AsyncRetrying.__init__ = original
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """Refuse a whole-suite run against a bundle unless somebody said out loud that they meant it.
+
+    Running every test against a flattened artifact costs minutes and answers one question: does the
+    code still work once it is a single file. Nothing about the answer can change until the work is
+    finished, so a mid-work run is time spent to learn something that has to be learned again later.
+    The gate says this too, but the gate is easy to step around -- this is the same policy where the
+    cost actually is, so stepping around the gate does not step around the decision.
+
+    Targeted runs are untouched: the point is to make the cheap path the easy one.
+    """
+    if not os.environ.get("OWUI_PIPE_BUNDLE_PATH"):
+        return
+    if os.environ.get("GATE_BUNDLE_RUN_APPROVED"):
+        return
+    # CI exists to run exactly this, on every bundle, every push. It is the one place where a whole
+    # bundled suite is the point rather than a detour.
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+        return
+    if len(items) < 500:
+        return
+    raise pytest.UsageError(
+        f"\n\n  Refusing to run {len(items)} tests against a bundled artifact mid-work.\n\n"
+        "  A bundled suite tells you whether the flattened file still behaves. That cannot\n"
+        "  change until the work is done, so this is an answer you will need again anyway.\n"
+        "  The package suite is what says whether the change is correct:\n\n"
+        "      scripts/gate.sh batch\n\n"
+        "  If the work IS finished and you mean to do the final check, the gate knows how to\n"
+        "  ask for it. Run a smaller selection if you only need a few tests under the bundle.\n"
+    )
