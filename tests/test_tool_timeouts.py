@@ -35,31 +35,61 @@ from open_webui_openrouter_pipe import _ToolExecutionContext
 from open_webui_openrouter_pipe.plugins.base import PluginBase
 from open_webui_openrouter_pipe.plugins.registry import PluginRegistry
 
-# 0.002, not smaller: the tests turn on differences such as 295 s against a 300 s limit, which at this
-# scale is 10 ms of real time. At 0.001 that margin reaches event-loop scheduling noise and the file
-# failed in two runs of three. Measured 2026-09-20; the whole file runs in ~34 s here against ~156 s at 0.01.
-SCALE = 0.002
+# Time here is simulated, never waited out. The loop jumps its own clock to the next scheduled wake-up
+# instead of sleeping until it, so a tool that "takes 300 seconds" costs nothing while still finishing
+# after one that takes 295. Ordering is exact because the jump is to a timer the loop already holds --
+# there is no race to lose. This replaced a scaled real clock whose margins shrank with the scale: at
+# 0.01 the file took 156 s, at 0.002 34 s, and at 0.001 it failed two runs in three.
+SCALE = 1.0
 NEVER = 100_000
 
 
+class _TimeTravelLoop(asyncio.SelectorEventLoop):
+    """An event loop that advances to the next timer rather than waiting for it.
+
+    `_scheduled` is the loop's own heap of pending wake-ups. When nothing is runnable, the earliest of
+    those is the only thing that can happen next, so moving the clock there changes what the loop does
+    next by exactly nothing -- except that it costs no real time.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skew = 0.0
+
+    def time(self) -> float:
+        return super().time() + self._skew
+
+    def _run_once(self) -> None:
+        if not self._ready and self._scheduled:
+            gap = self._scheduled[0]._when - self.time()
+            if gap > 0:
+                self._skew += gap
+        super()._run_once()
+
+
+class _TimeTravelPolicy(asyncio.DefaultEventLoopPolicy):
+    def new_event_loop(self):
+        return _TimeTravelLoop()
+
+
+@pytest.fixture
+def event_loop_policy(request):
+    """The jumping clock, except where a test asks for a real one.
+
+    Two tests deadlock on it: they arrange for a plugin to still be working when the batch deadline
+    passes, and with every wake-up collapsed to the same instant the loop reaches a state where no
+    timer is left to break the wait. They keep a real loop and shrink their own numbers instead --
+    what they check is the order of three limits against each other, not the size of any of them.
+    """
+    if request.node.get_closest_marker("real_clock"):
+        return asyncio.DefaultEventLoopPolicy()
+    return _TimeTravelPolicy()
+
+
 @contextlib.contextmanager
-def _scaled_clock(monkeypatch):
-    real_wait_for, real_timeout, real_wait = asyncio.wait_for, asyncio.timeout, asyncio.wait
-
-    async def wait_for(awaitable, timeout=None):
-        return await real_wait_for(awaitable, None if timeout is None else timeout * SCALE)
-
-    def timeout(delay):
-        return real_timeout(None if delay is None else delay * SCALE)
-
-    async def wait(tasks, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
-        return await real_wait(tasks, timeout=None if timeout is None else timeout * SCALE, return_when=return_when)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(asyncio, "wait_for", wait_for)
-        patch.setattr(asyncio, "timeout", timeout)
-        patch.setattr(asyncio, "wait", wait)
-        yield
+def _scaled_clock(_monkeypatch):
+    """Kept so the call sites read unchanged; the loop itself supplies the simulated time."""
+    yield
 
 
 def _builtin_ask_user(tool, exposed: str = "ask_user") -> dict[str, Any]:
@@ -1250,15 +1280,18 @@ class _TakesItsTimeOverEachToolResult(PluginBase):
         await asyncio.sleep(self._seconds * SCALE)
 
 
+@pytest.mark.real_clock
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("first", "second"), [(10, 20), (30, 50)])
+@pytest.mark.parametrize(("first", "second"), [(0.01, 0.02), (0.03, 0.05)])
 async def test_a_call_that_finishes_while_a_plugin_is_busy_with_an_earlier_result_keeps_its_own_result(
     pipe_instance_async, monkeypatch, first, second
 ):
-    # The plugin is still handling the first result when the 600 s batch limit passes, so the second call finished
-    # while nothing was collecting results. It must still be answered with its own result.
+    # The plugin is still handling the first result when the batch limit passes, so the second call finished
+    # while nothing was collecting results. It must still be answered with its own result. The three limits are
+    # a thousandth of the real ones and keep their order -- plugin 0.7 s outlasts the 0.6 s batch, both inside
+    # the 0.9 s idle limit -- because what is under test is which of them fires first.
     pipe = pipe_instance_async
-    plugin = _TakesItsTimeOverEachToolResult(700)
+    plugin = _TakesItsTimeOverEachToolResult(0.7)
     plugins = PluginRegistry()
     plugins._plugins = [plugin]
     plugins._hook_subscribers["on_tool_result"] = [(plugin, 50)]
@@ -1270,10 +1303,10 @@ async def test_a_call_that_finishes_while_a_plugin_is_busy_with_an_earlier_resul
         _call("second", "fetch", json.dumps({"seconds": second})),
     ]
 
-    outputs, _ = await _run(pipe, monkeypatch, registry, calls, timeout=300.0, batch_timeout=600.0, idle_timeout=900)
+    outputs, _ = await _run(pipe, monkeypatch, registry, calls, timeout=3.0, batch_timeout=0.6, idle_timeout=0.9)
 
     assert outputs["second"]["status"] == "completed", outputs
-    assert f"fetched after {second}s" in _text(outputs["second"]), outputs
+    assert f"fetched after {second:g}s" in _text(outputs["second"]), outputs
 
 # --- a tool that keeps timing out ------------------------------------------------------------------------------------
 
