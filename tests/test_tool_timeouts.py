@@ -35,7 +35,10 @@ from open_webui_openrouter_pipe import _ToolExecutionContext
 from open_webui_openrouter_pipe.plugins.base import PluginBase
 from open_webui_openrouter_pipe.plugins.registry import PluginRegistry
 
-SCALE = 0.01
+# 0.002, not smaller: the tests turn on differences such as 295 s against a 300 s limit, which at this
+# scale is 10 ms of real time. At 0.001 that margin reaches event-loop scheduling noise and the file
+# failed in two runs of three. Measured 2026-09-20; the whole file runs in ~34 s here against ~156 s at 0.01.
+SCALE = 0.002
 NEVER = 100_000
 
 

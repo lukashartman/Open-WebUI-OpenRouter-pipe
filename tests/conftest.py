@@ -516,3 +516,38 @@ def _no_real_network():
         socket.getaddrinfo = real_getaddrinfo
         socket.socket.connect = real_connect
         socket.socket.connect_ex = real_connect_ex
+
+
+@pytest.fixture(autouse=True)
+def retry_backoff():
+    """Record what a retry would have waited instead of waiting it out.
+
+    The pipe retries a failed call three times behind `tenacity`, backing off 0.5s then 1.0s.
+    Nine call sites use the default, so every test that drives a failing request pays 1.5 seconds
+    of real sleep -- about 40 seconds across the suite -- to prove things that have nothing to do
+    with how long a retry pauses: which error card is shown, whether a failure was counted.
+
+    `AsyncRetrying` binds its sleep as a default argument at class-definition time, so replacing
+    the module function does not reach it; the constructor is the seam. A test that cares about
+    the pause can ask for this fixture and read the delays, so nothing becomes unobservable --
+    it just stops being lived through.
+    """
+    from tenacity import AsyncRetrying
+
+    waited: list[float] = []
+    original = AsyncRetrying.__init__
+
+    async def _record(delay: float) -> None:
+        waited.append(delay)
+        await asyncio.sleep(0)
+
+    def _patched(self, *args, **kwargs):
+        if not args:
+            kwargs.setdefault("sleep", _record)
+        original(self, *args, **kwargs)
+
+    AsyncRetrying.__init__ = _patched
+    try:
+        yield waited
+    finally:
+        AsyncRetrying.__init__ = original
