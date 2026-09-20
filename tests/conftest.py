@@ -566,6 +566,10 @@ def pytest_collection_modifyitems(session, config, items):
     """
     if not os.environ.get("OWUI_PIPE_BUNDLE_PATH"):
         return
+    # Collecting every test under a bundle is the cheap structural check the batch tier does on purpose: it
+    # catches what only breaks once the package is one file, in seconds, without running anything.
+    if getattr(config.option, "collectonly", False):
+        return
     if os.environ.get("GATE_BUNDLE_RUN_APPROVED"):
         return
     # CI exists to run exactly this, on every bundle, every push. It is the one place where a whole
