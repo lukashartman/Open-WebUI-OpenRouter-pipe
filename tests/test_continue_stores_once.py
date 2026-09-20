@@ -73,7 +73,6 @@ def _select_open_webui_saving_mid_stream(monkeypatch, *, stored_before, saved_at
             return {"output": copy.deepcopy(state["stored"])}
 
     monkeypatch.setattr(streaming_core_mod, "Chats", _Chats)
-    monkeypatch.setattr(streaming_core_mod, "drain_approved_tool_calls", None, raising=False)
 
     def on_event(event):
         if event.get("type") == "chat:message:delta":
@@ -447,6 +446,50 @@ def _open_webui_convert_output_to_messages():
 _ONE_PIXEL_PNG = (
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 )
+
+
+@pytest.mark.asyncio
+async def test_a_pipeline_turn_replaying_its_own_tool_results_still_republishes_the_stored_answer(
+    monkeypatch, pipe_instance_async
+):
+    # Not a re-call: the results came back from the pipe's own rows, so Open WebUI does not hold them and replaces
+    # the stored output with whatever this call publishes. The stored answer has to go back out with it.
+    _select_open_webui(monkeypatch, stored=[STORED[2]])
+
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=False,
+        steps=_answer_steps("Part two."),
+        body_input=[
+            _user("hi"),
+            {"type": "function_call", "call_id": "call_A", "name": "lookup", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "ok"},
+        ],
+    )
+
+    assert _texts(published).count("Part one.") == 1, _texts(published)
+    assert "Part two." in "".join(_texts(published))
+
+
+@pytest.mark.asyncio
+async def test_a_mid_stream_save_is_not_republished_as_an_earlier_item_by_the_call_that_made_it(
+    monkeypatch, pipe_instance_async
+):
+    # A call without `assistant_message_id` is the one that still reads the stored output. Realtime chat save writes
+    # this call's own partial answer there from its first delta, so what it republishes has to rest on the stored
+    # output as it stood before the call streamed.
+    on_event = _select_open_webui_saving_mid_stream(
+        monkeypatch, stored_before=[STORED[2]], saved_at_first_delta=[STORED[2], _PARTIAL_SAVED]
+    )
+
+    published = await _published(
+        pipe_instance_async, monkeypatch, continued=False,
+        steps=_text_first_answer_steps("Part two."),
+        body_input=[_user("hi")],
+        on_event=on_event,
+    )
+
+    assert _PARTIAL_SAVED["id"] not in [item.get("id") for item in published], published
+    assert _texts(published).count("Part one.") == 1, _texts(published)
 
 
 async def _request_input(pipe, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
