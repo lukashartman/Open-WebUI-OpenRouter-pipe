@@ -14,6 +14,7 @@ from __future__ import annotations
 import __future__
 import ast
 import asyncio
+import collections
 from collections.abc import AsyncIterator
 import contextlib
 import functools
@@ -52,6 +53,11 @@ class _TimeTravelLoop(asyncio.SelectorEventLoop):
     next by exactly nothing -- except that it costs no real time.
     """
 
+    # CPython internals typeshed does not declare. Naming them states what this clock rests on;
+    # `test_the_event_loop_internals_the_jumping_clock_rests_on_still_exist` fails if one goes away.
+    _ready: Any
+    _scheduled: Any
+
     def __init__(self) -> None:
         super().__init__()
         self._skew = 0.0
@@ -64,7 +70,20 @@ class _TimeTravelLoop(asyncio.SelectorEventLoop):
             gap = self._scheduled[0]._when - self.time()
             if gap > 0:
                 self._skew += gap
-        super()._run_once()
+        super()._run_once()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_the_event_loop_internals_the_jumping_clock_rests_on_still_exist():
+    """A silent rename in CPython would stop the clock jumping without failing anything."""
+    loop = _TimeTravelLoop()
+    try:
+        assert isinstance(loop._ready, collections.deque)
+        assert isinstance(loop._scheduled, list)
+        loop.call_later(60.0, lambda: None)
+        assert isinstance(loop._scheduled[0]._when, float)
+        assert callable(asyncio.SelectorEventLoop._run_once)  # pyright: ignore[reportAttributeAccessIssue]
+    finally:
+        loop.close()
 
 
 class _TimeTravelPolicy(asyncio.DefaultEventLoopPolicy):
