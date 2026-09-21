@@ -244,3 +244,33 @@ async def test_a_card_says_the_same_thing_whether_the_failure_arrived_as_a_statu
     for name, expected in shown.items():
         assert rejected_values[name] == expected, (name, "as a rejection")
         assert in_band_values[name] == expected, (name, "inside a reply")
+
+
+# --- what the service card tells an admin a 503 means ------------------------------------------------------
+
+# Prescription 122 split the `503` line, which had stated routing constraints as THE cause, and added the
+# missing `504` row. The wording was fixed but nothing observed it: round 32's verify lens measured both
+# reverts SURVIVING the whole suite. These assert the factory template, not a rendered card -- a rendered card
+# carries OpenRouter's own `{reason}`, so a substring check there passes against the defect.
+def test_the_service_card_offers_both_meanings_of_a_503_rather_than_only_routing():
+    from open_webui_openrouter_pipe.core.config import DEFAULT_SERVICE_ERROR_TEMPLATE as template
+
+    line = next(ln for ln in template.splitlines() if ln.startswith("- `503`"))
+    assert "overloaded" in line, line
+    assert " or " in line, f"the 503 line states one cause as though it were the only one: {line}"
+
+
+def test_the_service_card_explains_the_504_it_is_rendered_for():
+    from open_webui_openrouter_pipe.core.config import DEFAULT_SERVICE_ERROR_TEMPLATE as template
+    from open_webui_openrouter_pipe.core.error_formatter import _IN_BAND_STATUS_BY_ERROR_TYPE
+
+    assert _IN_BAND_STATUS_BY_ERROR_TYPE["timeout"] == 504
+    assert any(ln.startswith("- `504`") for ln in template.splitlines()), template
+
+
+def test_the_service_cards_routing_advice_is_offered_as_a_possibility_not_a_diagnosis():
+    from open_webui_openrouter_pipe.core.config import DEFAULT_SERVICE_ERROR_TEMPLATE as template
+
+    advice = next(ln for ln in template.splitlines() if "routing constraints" in ln)
+    assert advice.lstrip("- ").startswith("If a `503` keeps repeating"), advice
+    assert "may be" in advice, f"the advice names routing as the cause rather than a possibility: {advice}"

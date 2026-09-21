@@ -1730,3 +1730,32 @@ async def test_a_round_hands_back_its_results_in_call_order_however_the_calls_fi
     assert finished != asked, f"the arm must finish out of order to test anything: {finished}"
     assert recorded == asked, recorded
     assert list(outputs) == asked, list(outputs)
+
+
+# --- the four places the idle limit is described to an operator ---------------------------------------------
+
+# Prescription 117 named four surfaces and the wording was fixed on all four, but nothing observed them: round
+# 32's verify lens measured each revert SURVIVING the whole suite. The limit is one wait for the whole round,
+# counted from the model's request -- not a fresh wait per call, in call order.
+IDLE_LIMIT_SURFACES = [
+    pytest.param("Field description", "open_webui_openrouter_pipe/core/config.py", id="field"),
+    pytest.param("Config tab detail", "open_webui_openrouter_pipe/plugins/pipe_dashboard/config_meta.py",
+                 id="config-tab"),
+    pytest.param("tooling doc", "docs/tooling_and_integrations.md", id="tooling-doc"),
+    pytest.param("valve atlas", "docs/valves_and_configuration_atlas.md", id="atlas"),
+]
+RETIRED_PER_CALL_PHRASES = ("for each tool call's result", "one by one in call order", "one at a time",
+                            "for each tool result, in turn")
+
+
+@pytest.mark.parametrize(("surface", "path"), IDLE_LIMIT_SURFACES)
+def test_every_place_the_idle_limit_is_described_calls_it_one_wait_for_the_round(surface, path):
+    import pathlib as _pathlib
+
+    text = _pathlib.Path(path).read_text(encoding="utf-8")
+    start = text.index("TOOL_IDLE_TIMEOUT_SECONDS")
+    window = text[start : start + 4000]
+
+    assert "in total for one response" in window, f"{surface} no longer calls it one wait for the round"
+    for phrase in RETIRED_PER_CALL_PHRASES:
+        assert phrase not in window, f"{surface} still promises a per-call wait: {phrase!r}"

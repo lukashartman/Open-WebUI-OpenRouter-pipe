@@ -424,7 +424,7 @@ DEFAULT_AUTHENTICATION_ERROR_TEMPLATE = (
 
 DEFAULT_INSUFFICIENT_CREDITS_TEMPLATE = (
     "### 💳 Insufficient Credits\n\n"
-    "OpenRouter could not run this request because the account is out of credits.\n\n"
+    "OpenRouter could not complete this request: the account is out of credits.\n\n"
     "**Error ID:** `{error_id}`\n"
     "{{#if request_id}}\n"
     "**OpenRouter request ID:** `{request_id}`\n"
@@ -456,7 +456,7 @@ DEFAULT_INSUFFICIENT_CREDITS_TEMPLATE = (
 
 DEFAULT_RATE_LIMIT_TEMPLATE = (
     "### ⏸️ Rate Limit Exceeded\n\n"
-    "OpenRouter refused this request because the account has reached one of its request limits.\n\n"
+    "OpenRouter could not complete this request: the account has reached one of its request limits.\n\n"
     "**Error ID:** `{error_id}`\n"
     "{{#if request_id}}\n"
     "**OpenRouter request ID:** `{request_id}`\n"
@@ -488,7 +488,7 @@ DEFAULT_RATE_LIMIT_TEMPLATE = (
 
 DEFAULT_SERVER_TIMEOUT_TEMPLATE = (
     "### 🕒 OpenRouter Timed Out\n\n"
-    "OpenRouter cancelled the request: the operation exceeded its time limit before any output was produced.\n\n"
+    "OpenRouter cancelled the request: it exceeded its time limit.\n\n"
     "**Error ID:** `{error_id}`\n"
     "{{#if request_id}}\n"
     "**OpenRouter request ID:** `{request_id}`\n"
@@ -1540,7 +1540,7 @@ class Valves(BaseModel):
         default=None,
         ge=1,
         description=(
-            "Maximum seconds to wait for each tool call's result before reporting that call as timed out; Open WebUI's ask_user waits at least its question window. On timeout, a call that is already running continues until it finishes, another tool limit ends it, or request cleanup cancels it after TOOL_SHUTDOWN_TIMEOUT_SECONDS (inside internal Fusion, without that wait, as soon as the calling model's answer ends). The model never receives the late result, though files or embeds the call returns can still appear in the chat. A call still waiting for a slot or a worker never starts. Null means no limit, leaving TOOL_TIMEOUT_SECONDS and TOOL_BATCH_TIMEOUT_SECONDS in charge."
+            "Maximum seconds to wait in total for one response's tool results, counted once from when the model asked; every call whose result has not arrived by then is reported as timed out, however long that call has been running; Open WebUI's ask_user waits at least its question window. On timeout, a call that is already running continues until it finishes, another tool limit ends it, or request cleanup cancels it after TOOL_SHUTDOWN_TIMEOUT_SECONDS (inside internal Fusion, without that wait, as soon as the calling model's answer ends). The model never receives the late result, though files or embeds the call returns can still appear in the chat. A call still waiting for a slot or a worker never starts. Null means no limit, leaving TOOL_TIMEOUT_SECONDS and TOOL_BATCH_TIMEOUT_SECONDS in charge."
         ),
     )
     TOOL_SHUTDOWN_TIMEOUT_SECONDS: float = Field(

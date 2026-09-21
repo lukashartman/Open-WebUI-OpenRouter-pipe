@@ -2255,10 +2255,11 @@ def test_the_service_error_card_does_not_swear_the_failure_cannot_be_yours(statu
         (
             408,
             "Request timed out upstream",
+            (r"time limit",),
             (r"(?:before any|without any|no)\s+(?:output|content|reply|tokens)",),
-            (),
-            "that nothing at all came back, so the reader is not left hunting for a partial "
-            "reply that was never produced",
+            "that the request ran out of time -- and NOT that nothing came back: a 408 reported "
+            "inside a reply already under way is rendered underneath the text that did arrive, "
+            "where a claim of no output contradicts what is on screen",
         ),
         (
             500,
