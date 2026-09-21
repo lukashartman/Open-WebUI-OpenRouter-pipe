@@ -105,14 +105,19 @@ def brings_tool_results(body: dict[str, Any]) -> bool:
     )
 
 
-def drop_skeleton_rounds_without_reasoning(items: list[Any]) -> list[Any]:
+def drop_skeleton_rounds_without_reasoning(
+    items: list[Any], *, keep_unterminated_turn: bool = False
+) -> list[Any]:
     kept: list[Any] = []
     region: list[Any] = []
     dropped = False
 
-    def close_region() -> None:
+    def close_region(*, unterminated: bool = False) -> None:
         nonlocal dropped
-        has_reasoning = any(isinstance(item, dict) and item.get("type") == "reasoning" for item in region)
+        spare = unterminated and keep_unterminated_turn
+        has_reasoning = spare or any(
+            isinstance(item, dict) and item.get("type") == "reasoning" for item in region
+        )
         for item in region:
             if not has_reasoning and isinstance(item, dict) and item.get(TOOL_ROUND_SKELETON_KEY):
                 dropped = True
@@ -126,7 +131,7 @@ def drop_skeleton_rounds_without_reasoning(items: list[Any]) -> list[Any]:
             kept.append(item)
         else:
             region.append(item)
-    close_region()
+    close_region(unterminated=True)
     return kept if dropped else items
 
 

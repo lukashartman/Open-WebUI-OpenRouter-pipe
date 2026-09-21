@@ -609,3 +609,71 @@ async def test_a_continue_of_an_unretained_tool_turn_sends_the_shape_anthropic_a
 
     assert _shape(wire["input"]) == accepted["shape"]
     assert _shape(wire["input"]) != rejected["shape"]
+
+
+# --- a Continue must still end on something the model accepts ----------------------------------------------------
+
+# A Continue sends the history stopping INSIDE the turn being written, so there is no trailing user message to
+# close the region. Removing that turn's skeleton rounds leaves the request ending on an assistant message.
+# Measured live 2026-09-21 on claude-opus-5, claude-sonnet-5, claude-fable-5.1, claude-opus-4.8 and
+# claude-sonnet-4.6: that shape is 400 "This model does not support assistant message prefill. The conversation
+# must end with a user message.", while the same history WITH its rounds kept is 200 on all five. The 4.5
+# generation accepts both. Every existing strip test feeds a list closed by a user message, which is why none of
+# them saw this.
+def _continue_shaped_items():
+    from open_webui_openrouter_pipe.core.utils import TOOL_ROUND_SKELETON_KEY
+
+    return [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]},
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Part one."}]},
+        {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}",
+         TOOL_ROUND_SKELETON_KEY: True},
+        {"type": "function_call_output", "call_id": "c1", "output": "[tool result not retained]",
+         TOOL_ROUND_SKELETON_KEY: True},
+    ]
+
+
+def _ends_on(items):
+    last = items[-1]
+    return f"{last['type']}:{last.get('role', '')}".rstrip(":")
+
+
+def test_the_unsigned_strip_leaves_a_continue_ending_on_a_tool_result():
+    from open_webui_openrouter_pipe.requests.sanitizer import _strip_unreplayable_anthropic_reasoning
+
+    items = _continue_shaped_items()
+    items[1] = {**items[1], "reasoning_details": [{"type": "reasoning.text", "text": "unsigned"}]}
+
+    out = _strip_unreplayable_anthropic_reasoning(items)
+
+    assert _ends_on(out) != "message:assistant", [_ends_on(out), out]
+    assert _ends_on(out) == "function_call_output", _ends_on(out)
+
+
+def test_the_signature_retry_leaves_a_continue_ending_on_a_tool_result():
+    from open_webui_openrouter_pipe.api.transforms import ResponsesBody
+
+    body = ResponsesBody(model="anthropic/claude-opus-4.8", input=_continue_shaped_items())
+    assert isinstance(body.input, list)
+    body.input[1] = {**body.input[1],
+                     "reasoning_details": [{"type": "reasoning.encrypted", "data": "SIGNED", "format": "x"}]}
+
+    Pipe()._ensure_reasoning_config_manager()._strip_replayed_reasoning(body)
+
+    assert isinstance(body.input, list)
+    assert _ends_on(body.input) != "message:assistant", [_ends_on(body.input), body.input]
+    assert _ends_on(body.input) == "function_call_output", _ends_on(body.input)
+
+
+def test_history_closed_by_a_user_message_still_drops_a_reasoningless_skeleton_round():
+    """The turn the Continue is writing is the only one spared: an earlier turn, closed by the user's next
+    message, still loses skeleton rounds that have no reasoning to anchor."""
+    from open_webui_openrouter_pipe.requests.sanitizer import _strip_unreplayable_anthropic_reasoning
+
+    items = _continue_shaped_items()
+    items[1] = {**items[1], "reasoning_details": [{"type": "reasoning.text", "text": "unsigned"}]}
+    items.append({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q2"}]})
+
+    out = _strip_unreplayable_anthropic_reasoning(items)
+
+    assert [item["type"] for item in out] == ["message", "message", "message"], out

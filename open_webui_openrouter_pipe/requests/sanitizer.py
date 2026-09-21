@@ -104,7 +104,7 @@ def _strip_unreplayable_anthropic_reasoning(items: list[Any]) -> list[Any]:
             changed = True
             item = {k: v for k, v in item.items() if k != "reasoning_details"}
         out.append(item)
-    return drop_skeleton_rounds_without_reasoning(out) if changed else items
+    return drop_skeleton_rounds_without_reasoning(out, keep_unterminated_turn=True) if changed else items
 
 
 def budget_model_id(body: Any) -> str:

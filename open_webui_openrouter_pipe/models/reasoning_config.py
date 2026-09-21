@@ -290,5 +290,5 @@ class ReasoningConfigManager:
                     changed = True
             cleaned.append(item)
         if changed:
-            responses_body.input = drop_skeleton_rounds_without_reasoning(cleaned)
+            responses_body.input = drop_skeleton_rounds_without_reasoning(cleaned, keep_unterminated_turn=True)
         return changed
