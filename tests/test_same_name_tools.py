@@ -494,3 +494,62 @@ def test_a_name_that_is_already_usable_is_returned_unchanged():
 
     assert _provider_tool_name("ok_name", "deadbeef", set()) == "ok_name"
     assert len(_provider_tool_name("x" * 70, "deadbeef", set())) <= 64
+
+
+# --- request specs the pipe has no tool for ----------------------------------------------------------------------
+
+# Prescription 125 asked for a registry-level arm built from "three request specs named `x`". It is writable: in
+# Open-WebUI mode the caller's specs are passed through and the collision loop names them apart. An earlier
+# deviation claimed it could not be written because such specs are dropped -- true in Pipeline mode only, which
+# is the mode that had been measured. Both modes are pinned here.
+REQUEST_SPECS_WITH_NO_TOOL = [
+    pytest.param(("x", "x", "x"), id="three-request-specs-sharing-one-name"),
+    pytest.param(("alpha", "beta"), id="two-request-specs-with-distinct-names"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("names", REQUEST_SPECS_WITH_NO_TOOL)
+async def test_request_specs_the_pipe_cannot_run_are_dropped_in_pipeline_mode(names):
+    """In Pipeline mode the pipe runs the tools, so a spec it has nothing to run is offered to nobody."""
+    tools, exec_registry, exposed_to_origin = _build_request_only(names, passthrough=False)
+
+    assert tools == [], tools
+    assert exec_registry == {}, exec_registry
+    assert exposed_to_origin == {}, exposed_to_origin
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("names", REQUEST_SPECS_WITH_NO_TOOL)
+async def test_request_specs_open_webui_will_run_keep_one_offered_name_each(names):
+    """In Open-WebUI mode the caller's own specs go to the model -- Open WebUI runs them, not the pipe. Each gets
+    one valid offered name of its own even when they share a name, and each maps back to the name Open WebUI
+    knows it by. Nothing is executable here, which is the point: the pipe is not the one running them."""
+    tools, exec_registry, exposed_to_origin = _build_request_only(names, passthrough=True)
+
+    offered = [tool["name"] for tool in tools]
+    assert len(offered) == len(names), offered
+    assert len(set(offered)) == len(names), offered
+    assert all(PROVIDER_FUNCTION_NAME.fullmatch(name) for name in offered), offered
+    assert len(exposed_to_origin) == len(names), exposed_to_origin
+    assert sorted(exposed_to_origin[name] for name in offered) == sorted(names), exposed_to_origin
+    assert exec_registry == {}, exec_registry
+
+
+def _build_request_only(names, *, passthrough: bool):
+    specs = [
+        {"name": name, "description": f"Tool {name}", "parameters": {"type": "object", "properties": {}}}
+        for name in names
+    ]
+    return _build_collision_safe_tool_specs_and_registry(
+        request_tool_specs=_chat_tools_to_responses_tools(
+            [{"type": "function", "function": spec} for spec in specs]
+        ),
+        owui_registry=None,
+        direct_registry=None,
+        builtin_registry=None,
+        extra_tools=None,
+        strictify=False,
+        owui_tool_passthrough=passthrough,
+        logger=None,
+    )

@@ -771,7 +771,8 @@ def _works_for(seconds: float, trace: list[str]):
     return tool
 
 
-async def _run_job(pipe, monkeypatch, registry, calls, *, model_seconds: float = 0, **valve_changes):
+async def _run_job(pipe, monkeypatch, registry, calls, *, model_seconds: float = 0, on_complete=None,
+                   **valve_changes):
     """Run one turn inside `_execute_pipe_job`, so the tool limits come from the valves exactly as a request gets them.
 
     Only the call to the model is replaced: it takes ``model_seconds`` to answer, then runs ``calls`` through the tool
@@ -785,6 +786,8 @@ async def _run_job(pipe, monkeypatch, registry, calls, *, model_seconds: float =
 
     async def call_the_model_and_run_its_tools(*_args, **_kwargs):
         await asyncio.sleep(model_seconds * SCALE)
+        if on_complete is not None:
+            pipe._TOOL_CONTEXT.get().on_complete = on_complete
         seen["outputs"] = await pipe._ensure_tool_executor()._execute_function_calls(calls, registry)
         return "turn finished"
 
@@ -1678,3 +1681,52 @@ async def test_the_wait_for_results_is_limited_once_for_the_round_not_once_per_c
         assert "fetched after 5s" in str(outputs["c0"].get("output")), outputs["c0"]
         assert sorted(cut) == ["c1", "c2", "c3"], outputs
     assert elapsed < 70, (elapsed, outputs)
+
+
+def _finishes_after(call_id: str, seconds: float, finished: list[str]):
+    async def tool(**_kwargs):
+        await asyncio.sleep(seconds * SCALE)
+        finished.append(call_id)
+        return f"{call_id} done"
+
+    return tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "calls",
+    [
+        [("a1", 250), ("b1", 30), ("c1", 120)],
+        [("x1", 30), ("y1", 250), ("z1", 120)],
+    ],
+    ids=["slowest-called-first", "slowest-called-second"],
+)
+async def test_a_round_hands_back_its_results_in_call_order_however_the_calls_finish(
+    pipe_instance_async, monkeypatch, calls
+):
+    """The order a round's results are handed back in is the order the model asked for them, not the order the
+    tools happened to finish.
+
+    This matters beyond the cards: the hand-back is also the moment each result is recorded for replay, so the
+    order here becomes the order the next turn sends upstream. Reasoning anchors and skeleton rounds are numbered
+    against that sequence. Nothing pinned it before, which is why the question of whether the round may be driven
+    by completion instead could not be answered by running the replay suites -- they never reach this code.
+    """
+    recorded: list[str] = []
+    finished: list[str] = []
+    registry: dict[str, Any] = {}
+    for call_id, seconds in calls:
+        registry[call_id] = _entry(_finishes_after(call_id, seconds, finished), tool_type="function", name=call_id)
+
+    async def _record(call, _output):
+        recorded.append(call.get("call_id"))
+
+    outputs = await _run_job(
+        pipe_instance_async, monkeypatch, registry, [_call(cid, cid) for cid, _ in calls], on_complete=_record
+    )
+
+    asked = [cid for cid, _ in calls]
+    assert sorted(finished) == sorted(asked), finished
+    assert finished != asked, f"the arm must finish out of order to test anything: {finished}"
+    assert recorded == asked, recorded
+    assert list(outputs) == asked, list(outputs)
