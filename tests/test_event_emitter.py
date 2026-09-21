@@ -208,9 +208,8 @@ async def test_emit_error_event_basic(event_handler):
         done=True,
     )
 
-    assert len(emitted) == 1
-    assert emitted[0]["type"] == "chat:completion"
-    assert emitted[0]["data"]["error"]["message"] == "Test error message"
+    assert [event["type"] for event in emitted] == ["status", "chat:completion"], emitted
+    assert emitted[-1]["data"]["error"]["message"] == "Test error message"
 
 
 @pytest.mark.asyncio
@@ -2063,3 +2062,28 @@ async def test_make_middleware_stream_emitter_delta_with_mismatched_content(pipe
 
     # Should fallback to assistant_sent + delta
     assert queue.qsize() == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("done", [True, False], ids=["turn-is-over", "turn-continues"])
+async def test_an_error_that_ends_the_turn_also_stops_the_progress_line(event_handler, done):
+    """A failure card under a progress line still saying "Thinking..." reads as a stalled request rather than a
+    finished one. The templated error path already closes it; this sibling is the other way an error reaches the
+    chat, and it must close it too -- but only when the error actually ends the turn."""
+    emitted = []
+
+    async def capture_emitter(event):
+        emitted.append(event)
+
+    await event_handler._emit_error_event(
+        capture_emitter, "Something failed", show_error_message=True, done=done
+    )
+
+    statuses = [event for event in emitted if event["type"] == "status"]
+    if done:
+        assert statuses, emitted
+        assert statuses[-1]["data"]["done"] is True, statuses
+        assert emitted.index(statuses[-1]) < len(emitted) - 1, emitted
+    else:
+        assert statuses == [], emitted
+    assert emitted[-1]["type"] == "chat:completion", emitted

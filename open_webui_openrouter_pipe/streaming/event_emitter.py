@@ -213,6 +213,14 @@ class EventEmitterHandler:
 
         if show_error_message and event_emitter:
             try:
+                if done:
+                    await event_emitter({
+                        "type": "status",
+                        "data": {
+                            "description": "The request could not be completed. See details below.",
+                            "done": True,
+                        },
+                    })
                 await event_emitter(
                     {
                         "type": "chat:completion",
