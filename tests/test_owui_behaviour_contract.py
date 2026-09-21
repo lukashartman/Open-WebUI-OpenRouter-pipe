@@ -106,7 +106,9 @@ def test_a_finished_round_is_replayed_as_a_tool_call_and_its_result(open_webui) 
 
 
 def test_a_result_holding_an_image_is_followed_by_a_message_of_open_webuis_own(open_webui) -> None:
-    """The message it writes out is why the pipe's turn scan needs the rule ledger 110 gave it."""
+    """Open WebUI writes the round's images out as a message of its own, so a rebuilt turn contains a user
+    message nobody typed. The turn scan that had to allow for that is gone (ledger 118); this pins the
+    Open WebUI behaviour itself, which the pipe still reads back when it rebuilds history."""
     messages = open_webui["convert_output_to_messages"](
         [_call("c0"), _result("c0", image=True)], raw=True, flatten_tool_images=True
     )
@@ -120,7 +122,7 @@ def test_a_result_holding_an_image_is_followed_by_a_message_of_open_webuis_own(o
 
 
 def test_rounds_run_back_to_back_are_batched_and_the_images_written_out_after_them(open_webui) -> None:
-    """Where that message lands is what the pipe's turn scan has to allow for.
+    """Where that message lands decides which round the images belong to in a rebuilt turn.
 
     A turn's rounds are held together and written out as one assistant message carrying both calls,
     then both results, then the images. Anything that is not a call or a result -- the model saying

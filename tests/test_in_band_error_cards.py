@@ -23,12 +23,13 @@ from open_webui_openrouter_pipe import Pipe
 _RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 _CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 _MARKERS = {
-    "OPENROUTER_ERROR_TEMPLATE": "### REJECTED-CARD",
-    "RATE_LIMIT_TEMPLATE": "### RATE-LIMIT-CARD",
+    "OPENROUTER_ERROR_TEMPLATE": "### REJECTED-CARD {status_code}",
+    "RATE_LIMIT_TEMPLATE": "### RATE-LIMIT-CARD {status_code}",
     "SERVICE_ERROR_TEMPLATE": "### SERVICE-CARD {status_code}",
-    "SERVER_TIMEOUT_TEMPLATE": "### SERVER-TIMEOUT-CARD",
-    "AUTHENTICATION_ERROR_TEMPLATE": "### AUTH-CARD",
-    "INSUFFICIENT_CREDITS_TEMPLATE": "### CREDITS-CARD",
+    "SERVER_TIMEOUT_TEMPLATE": "### SERVER-TIMEOUT-CARD {status_code}",
+    "AUTHENTICATION_ERROR_TEMPLATE": "### AUTH-CARD {status_code}",
+    "INSUFFICIENT_CREDITS_TEMPLATE": "### CREDITS-CARD {status_code}",
+    "PAYLOAD_TOO_LARGE_TEMPLATE": "### PAYLOAD-CARD {status_code}",
     "INTERNAL_ERROR_TEMPLATE": "### UNEXPECTED-CARD",
 }
 
@@ -118,41 +119,44 @@ def _responses_body(code: str, error_type: str) -> bytes:
 
 
 # Each arm: the endpoint, whether the turn streams, the reply body, and the message the person must read.
-_ARMS: dict[str, tuple[str, bool, bytes, str]] = {
-    "chat-stream-rate-limit": ("chat_completions", True, _chat_stream(429, "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE"),
-    "chat-stream-provider-unavailable": ("chat_completions", True, _chat_stream(502, "provider_unavailable"), "SERVICE_ERROR_TEMPLATE"),
-    "chat-stream-provider-overloaded": ("chat_completions", True, _chat_stream(503, "provider_overloaded"), "SERVICE_ERROR_TEMPLATE"),
-    "chat-stream-provider-timed-out": ("chat_completions", True, _chat_stream(504, "timeout"), "SERVICE_ERROR_TEMPLATE"),
-    "chat-stream-invalid-request": ("chat_completions", True, _chat_stream(400, "invalid_request"), "OPENROUTER_ERROR_TEMPLATE"),
-    "chat-body-out-of-credits": ("chat_completions", False, _chat_body(402, "payment_required"), "INSUFFICIENT_CREDITS_TEMPLATE"),
-    "responses-stream-rate-limit": ("responses", True, _responses_stream("rate_limit_exceeded", "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE"),
-    "responses-stream-server-error": ("responses", True, _responses_stream("server_error", "server"), "SERVICE_ERROR_TEMPLATE"),
-    "responses-stream-invalid-prompt": ("responses", True, _responses_stream("invalid_prompt", "invalid_request"), "OPENROUTER_ERROR_TEMPLATE"),
-    "responses-body-authentication": ("responses", False, _responses_body("server_error", "authentication"), "AUTHENTICATION_ERROR_TEMPLATE"),
-    "chat-stream-provider-disconnected": ("chat_completions", True, _chat_stream_native("server_error"), "SERVICE_ERROR_TEMPLATE"),
-    "chat-stream-kind-the-pipe-does-not-know": ("chat_completions", True, _chat_stream(429, "quota_exhausted"), "RATE_LIMIT_TEMPLATE"),
-    "responses-stream-error-event-rate-limit": ("responses", True, _responses_error_event("response.error", "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE"),
-    "responses-stream-error-event-invalid-key": ("responses", True, _responses_error_event("error", "invalid_api_key"), "AUTHENTICATION_ERROR_TEMPLATE"),
-    "responses-stream-error-event-blocked-image": ("responses", True, _responses_error_event("response.error", "image_content_policy_violation"), "OPENROUTER_ERROR_TEMPLATE"),
-    "responses-stream-error-event-unknown-code": ("responses", True, _responses_error_event("error", "wolves_ate_the_response"), "OPENROUTER_ERROR_TEMPLATE"),
+_ARMS: dict[str, tuple[str, bool, bytes, str, int]] = {
+    "chat-stream-rate-limit": ("chat_completions", True, _chat_stream(429, "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE", 429),
+    "chat-stream-provider-unavailable": ("chat_completions", True, _chat_stream(502, "provider_unavailable"), "SERVICE_ERROR_TEMPLATE", 502),
+    "chat-stream-provider-overloaded": ("chat_completions", True, _chat_stream(503, "provider_overloaded"), "SERVICE_ERROR_TEMPLATE", 503),
+    "chat-stream-provider-timed-out": ("chat_completions", True, _chat_stream(504, "timeout"), "SERVICE_ERROR_TEMPLATE", 504),
+    "chat-stream-invalid-request": ("chat_completions", True, _chat_stream(400, "invalid_request"), "OPENROUTER_ERROR_TEMPLATE", 400),
+    "chat-body-out-of-credits": ("chat_completions", False, _chat_body(402, "payment_required"), "INSUFFICIENT_CREDITS_TEMPLATE", 402),
+    "responses-stream-rate-limit": ("responses", True, _responses_stream("rate_limit_exceeded", "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE", 429),
+    "responses-stream-server-error": ("responses", True, _responses_stream("server_error", "server"), "SERVICE_ERROR_TEMPLATE", 500),
+    "responses-stream-invalid-prompt": ("responses", True, _responses_stream("invalid_prompt", "invalid_request"), "OPENROUTER_ERROR_TEMPLATE", 400),
+    "responses-body-authentication": ("responses", False, _responses_body("server_error", "authentication"), "AUTHENTICATION_ERROR_TEMPLATE", 401),
+    "chat-stream-provider-disconnected": ("chat_completions", True, _chat_stream_native("server_error"), "SERVICE_ERROR_TEMPLATE", 500),
+    "chat-stream-kind-the-pipe-does-not-know": ("chat_completions", True, _chat_stream(429, "quota_exhausted"), "RATE_LIMIT_TEMPLATE", 429),
+    "responses-stream-error-event-rate-limit": ("responses", True, _responses_error_event("response.error", "rate_limit_exceeded"), "RATE_LIMIT_TEMPLATE", 429),
+    "responses-stream-error-event-invalid-key": ("responses", True, _responses_error_event("error", "invalid_api_key"), "AUTHENTICATION_ERROR_TEMPLATE", 401),
+    "responses-stream-error-event-blocked-image": ("responses", True, _responses_error_event("response.error", "image_content_policy_violation"), "OPENROUTER_ERROR_TEMPLATE", 403),
+    "responses-stream-error-event-unknown-code": ("responses", True, _responses_error_event("error", "wolves_ate_the_response"), "OPENROUTER_ERROR_TEMPLATE", 400),
+    # every remaining row of _IN_BAND_STATUS_BY_ERROR_TYPE, sent with a numeric code of 400 so the arm fails
+    # if the kind stops deciding the status
+    "chat-stream-permission-denied": ("chat_completions", True, _chat_stream(400, "permission_denied"), "OPENROUTER_ERROR_TEMPLATE", 403),
+    "chat-stream-content-policy": ("chat_completions", True, _chat_stream(400, "content_policy_violation"), "OPENROUTER_ERROR_TEMPLATE", 403),
+    "chat-stream-refusal": ("chat_completions", True, _chat_stream(400, "refusal"), "OPENROUTER_ERROR_TEMPLATE", 403),
+    "chat-stream-not-found": ("chat_completions", True, _chat_stream(400, "not_found"), "OPENROUTER_ERROR_TEMPLATE", 404),
+    "chat-stream-image-not-found": ("chat_completions", True, _chat_stream(400, "image_not_found"), "OPENROUTER_ERROR_TEMPLATE", 404),
+    "chat-stream-precondition-failed": ("chat_completions", True, _chat_stream(400, "precondition_failed"), "OPENROUTER_ERROR_TEMPLATE", 412),
+    "chat-stream-payload-too-large": ("chat_completions", True, _chat_stream(400, "payload_too_large"), "PAYLOAD_TOO_LARGE_TEMPLATE", 413),
+    "chat-stream-unprocessable": ("chat_completions", True, _chat_stream(400, "unprocessable"), "OPENROUTER_ERROR_TEMPLATE", 422),
+    "chat-stream-unmapped": ("chat_completions", True, _chat_stream(400, "unmapped"), "SERVICE_ERROR_TEMPLATE", 500),
+    "chat-stream-timed-out-in-band": ("chat_completions", True, _chat_stream(408, "request_timeout"), "SERVER_TIMEOUT_TEMPLATE", 408),
 }
 
 
 # The service card prints the status the pipe resolved, and the built-in template explains that number to the
 # reader, so the number itself is part of what the person is told.
-_SERVICE_CARD_STATUS: dict[str, int] = {
-    "chat-stream-provider-unavailable": 502,
-    "chat-stream-provider-overloaded": 503,
-    "chat-stream-provider-timed-out": 504,
-    "responses-stream-server-error": 500,
-    "chat-stream-provider-disconnected": 500,
-}
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arm", list(_ARMS))
 async def test_a_failure_reported_inside_a_started_reply_shows_the_message_for_that_failure(monkeypatch, arm):
-    endpoint, stream, body, expected = _ARMS[arm]
+    endpoint, stream, body, expected, expected_status = _ARMS[arm]
     pipe = _pipe_reaching_the_model(monkeypatch, endpoint)
     try:
         with aioresponses() as mock_http:
@@ -162,8 +166,7 @@ async def test_a_failure_reported_inside_a_started_reply_shows_the_message_for_t
         await pipe.close()
 
     assert _cards(reply) == [expected], reply
-    if arm in _SERVICE_CARD_STATUS:
-        assert f"### SERVICE-CARD {_SERVICE_CARD_STATUS[arm]}" in reply, reply
+    assert _MARKERS[expected].format(status_code=expected_status) in reply, reply
 
 
 # ---------------------------------------------------------------------------
