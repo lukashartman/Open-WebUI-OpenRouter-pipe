@@ -855,7 +855,7 @@ CONFIG_META: dict[str, dict[str, str]] = {
     "TOOL_IDLE_TIMEOUT_SECONDS": {
         "title": "Tool result wait limit",
         "group": "Tools/Execution",
-        "detail": "How long the pipe waits for each tool result, in turn, before reporting a timeout.\n\nGiving up is not a tool failure, but the call's later error or `Tool call timeout` is; a later success clears the count. A running call keeps its slot until it finishes, another limit ends it, or cleanup cancels it after its request (inside internal Fusion, its model's answer) ends. The model never gets the late result, though files can reach the chat. A call not yet started never starts. `ask_user` gets at least its question window. Applies only when `Tool execution location` is `Pipeline`."
+        "detail": "How long the pipe waits in total for one response's tool results, counted once from the model's request.\n\nEvery call whose result has not arrived by then is reported as timed out, however long that call itself has been running.\n\nGiving up is not a tool failure, but the call's later error or `Tool call timeout` is; a later success clears the count. A running call keeps its slot until it finishes, another limit ends it, or cleanup cancels it after its request (inside internal Fusion, its model's answer) ends. The model never gets the late result, though files can reach the chat. A call not yet started never starts. `ask_user` gets at least its question window. Applies only when `Tool execution location` is `Pipeline`."
     },
     "TOOL_OUTPUT_RETENTION_TURNS": {
         "title": "Tool output history depth",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from ..api.transforms import _filter_replayable_input_items
@@ -250,8 +251,8 @@ def _validate_tool_call_pairs(
       Frontier function_call items (no user message after them) are left
       alone because they represent pending tool executions.
     """
-    call_ids: set[str] = set()
-    output_ids: set[str] = set()
+    call_counts: Counter[str] = Counter()
+    output_counts: Counter[str] = Counter()
 
     for item in items:
         if not isinstance(item, dict):
@@ -262,14 +263,19 @@ def _validate_tool_call_pairs(
         cid = call_id.strip()
         item_type = item.get("type")
         if item_type == "function_call":
-            call_ids.add(cid)
+            call_counts[cid] += 1
         elif item_type == "function_call_output":
-            output_ids.add(cid)
+            output_counts[cid] += 1
 
-    orphaned_outputs = output_ids - call_ids
-    orphaned_calls = call_ids - output_ids
+    orphaned_outputs = {cid for cid in output_counts if not call_counts[cid]}
+    orphaned_calls = {cid for cid in call_counts if not output_counts[cid]}
+    surplus_outputs = {
+        cid: output_counts[cid] - call_counts[cid]
+        for cid in output_counts
+        if call_counts[cid] and output_counts[cid] > call_counts[cid]
+    }
 
-    if not orphaned_outputs and not orphaned_calls:
+    if not orphaned_outputs and not orphaned_calls and not surplus_outputs:
         return items
 
     interior_orphaned_calls: set[str] = set()
@@ -298,6 +304,12 @@ def _validate_tool_call_pairs(
             len(orphaned_outputs),
             sorted(orphaned_outputs),
         )
+    if surplus_outputs:
+        logger.warning(
+            "Dropping %d surplus function_call_output item(s) beyond the calls that carry their id: %s",
+            sum(surplus_outputs.values()),
+            sorted(surplus_outputs),
+        )
     if interior_orphaned_calls:
         logger.warning(
             "Synthesising stub function_call_output for %d orphaned function_call item(s): call_ids=%s",
@@ -306,6 +318,7 @@ def _validate_tool_call_pairs(
         )
 
     result: list[Any] = []
+    emitted: Counter[str] = Counter()
     for item in items:
         if not isinstance(item, dict):
             result.append(item)
@@ -316,6 +329,11 @@ def _validate_tool_call_pairs(
 
         if item_type == "function_call_output" and cid in orphaned_outputs:
             continue
+
+        if item_type == "function_call_output" and cid in surplus_outputs:
+            if emitted[cid] >= call_counts[cid]:
+                continue
+            emitted[cid] += 1
 
         result.append(item)
 

@@ -6,6 +6,7 @@ Handles event emission to Open WebUI and middleware stream queue management.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import json
 import logging
@@ -252,6 +253,7 @@ class EventEmitterHandler:
         log_message: str,
         log_level: int = logging.ERROR,
         partial_answer: str = "",
+        fallback_template: str | None = None,
     ) -> str:
         """Render and emit an error using the template system.
 
@@ -283,6 +285,11 @@ class EventEmitterHandler:
             markdown = _render_error_template(template, enriched_variables)
         except Exception:
             self.logger.exception("[%s] Template rendering failed", error_id)
+            markdown = ""
+            if fallback_template is not None:
+                with contextlib.suppress(Exception):
+                    markdown = _render_error_template(fallback_template, enriched_variables)
+        if not markdown:
             markdown = (
                 f"### ⚠️ Error\n\n"
                 f"An error occurred, but we couldn't format the error message properly.\n\n"

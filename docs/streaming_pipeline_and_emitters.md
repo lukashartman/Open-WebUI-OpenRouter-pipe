@@ -115,12 +115,13 @@ Open WebUI's bookkeeping depends on what it is doing, and the pipe has to match 
   replayed reasoning would double as well. The pipe recognises this by the message id the frontend sends only
   when continuing.
 - **Its own tool loop.** Each time Open WebUI runs a round and calls the pipe back, it sets the turn's output
-  aside the same way, but sends no such id. This is the path on which the pipe still reads the stored output,
-  and it has to tell a round Open WebUI has just run from one already stored.
+  aside the same way, but sends no such id. The pipe therefore reads the stored output on that path - and finds
+  nothing, because Open WebUI writes a message's output once, when the message finishes. Measured on a live
+  server: across a two-round turn the row carried no output at all until the moment it was marked done.
 
-That second test counts results rather than matching their ids: tool call ids are not unique - the
-chat-completions adapters number them per request - so a re-call whose id happens to match a stored one must
-still be recognised as a re-call.
+So the read exists for one caller only: a client posting to the completions endpoint directly with the id of a
+message that already holds output. Open WebUI's own chat never produces that state, and for the direct caller
+republishing is the right answer, because nothing else will put those items back.
 
 One consequence is worth stating plainly, because it is a deliberate choice rather than an oversight: a tool
 call left unfinished by Stop, on a message that is then continued, drops out of later history instead of being

@@ -86,8 +86,15 @@ _EXPECTED: dict[str, int] = {
     "pipe.py": 20,
     "requests/transformer.py": 2,
     "storage/persistence.py": 3,
+    # 1st: the caller-supplied fallback in `_emit_templated_error_event`. It is reached only because the
+    # admin's own template already failed to render, and the generic card below it is the answer if the
+    # fallback fails too -- letting it out would replace the failure being reported with a template error.
+    "streaming/event_emitter.py": 1,
     "streaming/streaming_core.py": 2,
-    "tools/tool_executor.py": 4,
+    # 5th: the tool card emitted as each call's result is collected, the twin of the one in the loop that
+    # follows. The card is what the person sees; a failure emitting it must not lose the tool result the
+    # loop is in the middle of collecting, which is the model's answer.
+    "tools/tool_executor.py": 5,
 }
 
 

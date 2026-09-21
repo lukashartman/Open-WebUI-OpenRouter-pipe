@@ -113,6 +113,8 @@ KEYS_OPEN_WEBUI_BUILDS = [
         id="key-longer-than-64",
     ),
     pytest.param(("tool_a", "Weather API", "Weather_API"), "search", id="two-keys-that-clean-up-alike"),
+    pytest.param(("tool_a", "Weather API", "Weather_API", "Weather.API"), "search",
+                 id="three-keys-that-clean-up-alike"),
 ]
 
 
@@ -463,7 +465,8 @@ def test_a_replayed_name_two_advertised_tools_could_mean_is_not_rewritten_to_eit
     assert re.fullmatch(r"[A-Za-z0-9_-]{1,64}", items[0]["name"]), items[0]["name"]
 
 
-def test_every_candidate_keeps_a_name_of_its_own_even_when_three_share_one():
+@pytest.mark.parametrize("origin", ["x", "y" * 70], ids=["short-name", "name-over-the-limit"])
+def test_every_candidate_keeps_a_name_of_its_own_even_when_three_share_one(origin):
     """The builder is named for collision safety, so no candidate may lose its name to another.
 
     Two same-named candidates are fine: the first keeps the plain name and the second takes the digest.
@@ -476,7 +479,7 @@ def test_every_candidate_keeps_a_name_of_its_own_even_when_three_share_one():
     used: set[str] = set()
     names = []
     for _ in range(3):
-        name = _provider_tool_name("x", "deadbeef", used)
+        name = _provider_tool_name(origin, "deadbeef", used)
         used.add(name)
         names.append(name)
 

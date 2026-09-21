@@ -6,7 +6,7 @@
 
 **520+ AI models. Chat, image, video, and live multi-model Fusion with full access to your knowledge bases and tools — all from your Open WebUI.**
 
-GPT-5.6, Gemini 3.1, Claude Opus, Llama 4, FLUX.2, Sora 2, Veo 3.1, Kling, Wan, Riverflow — text, images, and video generation through OpenRouter's unified API, plus live multi-model Fusion deliberation that runs inside your Open WebUI — panels that draw on your knowledge bases and tools, not just the open web. One key, one bill, every model that matters.
+GPT-6 Astra Pro, Claude Fable 5.1, Gemini 3.8, Grok 4.6 — the open-weight frontier too, with DeepSeek V4.1, Kimi K3 and GLM 5.3 — plus FLUX.2, GPT Image 2.5, Seedream 5.0, Riverflow, Sora 2, Veo 3.1, Kling v3 and Wan 3.0 for pictures and video. Text, images, and video generation through OpenRouter's unified API, plus live multi-model Fusion deliberation that runs inside your Open WebUI — panels that draw on your knowledge bases and tools, not just the open web. One key, one bill, every model that matters.
 
 <p align="center">
   <img align="top" width="49%" alt="chat" src="https://github.com/user-attachments/assets/c937443b-f1be-4091-9555-b49789f16a97" />

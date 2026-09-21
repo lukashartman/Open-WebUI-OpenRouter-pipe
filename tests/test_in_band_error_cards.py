@@ -25,7 +25,7 @@ _CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 _MARKERS = {
     "OPENROUTER_ERROR_TEMPLATE": "### REJECTED-CARD",
     "RATE_LIMIT_TEMPLATE": "### RATE-LIMIT-CARD",
-    "SERVICE_ERROR_TEMPLATE": "### SERVICE-CARD",
+    "SERVICE_ERROR_TEMPLATE": "### SERVICE-CARD {status_code}",
     "SERVER_TIMEOUT_TEMPLATE": "### SERVER-TIMEOUT-CARD",
     "AUTHENTICATION_ERROR_TEMPLATE": "### AUTH-CARD",
     "INSUFFICIENT_CREDITS_TEMPLATE": "### CREDITS-CARD",
@@ -66,7 +66,7 @@ async def _turn(pipe: Pipe, *, stream: bool) -> str:
 
 
 def _cards(reply: str) -> list[str]:
-    return [name for name, marker in _MARKERS.items() if marker in reply]
+    return [name for name, marker in _MARKERS.items() if marker.split(" {", 1)[0] in reply]
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -138,6 +138,17 @@ _ARMS: dict[str, tuple[str, bool, bytes, str]] = {
 }
 
 
+# The service card prints the status the pipe resolved, and the built-in template explains that number to the
+# reader, so the number itself is part of what the person is told.
+_SERVICE_CARD_STATUS: dict[str, int] = {
+    "chat-stream-provider-unavailable": 502,
+    "chat-stream-provider-overloaded": 503,
+    "chat-stream-provider-timed-out": 504,
+    "responses-stream-server-error": 500,
+    "chat-stream-provider-disconnected": 500,
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arm", list(_ARMS))
 async def test_a_failure_reported_inside_a_started_reply_shows_the_message_for_that_failure(monkeypatch, arm):
@@ -151,6 +162,8 @@ async def test_a_failure_reported_inside_a_started_reply_shows_the_message_for_t
         await pipe.close()
 
     assert _cards(reply) == [expected], reply
+    if arm in _SERVICE_CARD_STATUS:
+        assert f"### SERVICE-CARD {_SERVICE_CARD_STATUS[arm]}" in reply, reply
 
 
 # ---------------------------------------------------------------------------

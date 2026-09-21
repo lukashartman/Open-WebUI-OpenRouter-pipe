@@ -460,6 +460,7 @@ class ToolExecutor:
                 if window is not None:
                     allowance = max(allowance, window)
         collected: dict[int, Any] = {}
+        notified: set[int] = set()
         try:
             async with asyncio.timeout(allowance) if allowance else contextlib.nullcontext():
                 for index, (call, future, _window) in enumerate(pending):
@@ -480,6 +481,10 @@ class ToolExecutor:
                             self._tool_error_text(exc),
                             status="failed",
                         )
+                    if _on_complete:
+                        with contextlib.suppress(Exception):
+                            await _on_complete(call, collected[index])
+                    notified.add(index)
         except TimeoutError:
             pass
 
@@ -509,7 +514,7 @@ class ToolExecutor:
                     context.timeout_error = message
                 self.logger.warning("Tool idle timeout: %s", message)
                 result = self._build_tool_output(call, message, status="failed")
-            if _on_complete:
+            if _on_complete and index not in notified:
                 with contextlib.suppress(Exception):
                     await _on_complete(call, result)
             outputs.append(result)

@@ -145,6 +145,7 @@ class ErrorFormatter:
         log_message: str,
         log_level: int = logging.ERROR,
         partial_answer: str = "",
+        fallback_template: str | None = None,
     ) -> str:
         if not self._event_emitter_handler:
             return ""
@@ -155,6 +156,7 @@ class ErrorFormatter:
             log_message=log_message,
             log_level=log_level,
             partial_answer=partial_answer,
+            fallback_template=fallback_template,
         )
 
     def _build_error_context(self) -> tuple[str, dict[str, Any]]:

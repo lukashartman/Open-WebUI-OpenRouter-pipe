@@ -2938,13 +2938,15 @@ class Pipe:
         if batch_timeout and open_windows:
             batch_timeout = max(float(batch_timeout), *open_windows)
         tasks = [asyncio.ensure_future(self._invoke_tool_call(item, context)) for item in batch]
+        breaker = self._ensure_tool_executor()._tool_breaker(context)
         try:
             async with asyncio.timeout(batch_timeout or None):
                 running = set(tasks)
                 while running:
                     finished, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-                    for item, task in zip(batch, tasks):
+                    for item, task, ask_user_window in zip(batch, tasks, ask_user_windows):
                         if task in finished and not item.future.done():
+                            self._count_self_cancelled_tool(item, task, context, breaker, ask_user_window)
                             await self._hand_back_tool_result(item, context, *self._finished_tool_output(item, task))
         except TimeoutError:
             pass
@@ -2965,7 +2967,6 @@ class Pipe:
             )
             context.timeout_error = context.timeout_error or message
             self.logger.warning("%s", message)
-        breaker = self._ensure_tool_executor()._tool_breaker(context)
         for item, task, ask_user_window in zip(batch, tasks, ask_user_windows):
             if item.future.done():
                 continue
@@ -2979,10 +2980,29 @@ class Pipe:
                 payload = self._ensure_tool_executor()._build_tool_output(item.call, message, status="failed")
                 resolved_status = "failed"
             else:
+                self._count_self_cancelled_tool(item, task, context, breaker, ask_user_window)
                 payload, resolved_status = self._finished_tool_output(item, task)
             await self._hand_back_tool_result(item, context, payload, resolved_status)
 
     @timed
+    def _count_self_cancelled_tool(
+        self,
+        item: _QueuedToolCall,
+        task: asyncio.Task[tuple[str, str, list[dict[str, Any]], list[str]]],
+        context: _ToolExecutionContext,
+        breaker: Any,
+        ask_user_window: float | None,
+    ) -> None:
+        if not task.cancelled() or ask_user_window is not None:
+            return
+        if not item.holds_slot or breaker is None:
+            return
+        breaker.record_tool_failure(
+            context.user_id,
+            (item.tool_cfg.get("type") or "function").lower(),
+            str(item.call.get("name") or ""),
+        )
+
     def _finished_tool_output(
         self,
         item: _QueuedToolCall,

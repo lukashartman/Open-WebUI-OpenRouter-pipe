@@ -180,7 +180,8 @@ def _text(output: dict[str, Any]) -> str:
     return str(output.get("output"))
 
 
-async def _run(pipe, monkeypatch, registry, calls, *, timeout=60.0, batch_timeout=120.0, idle_timeout=None):
+async def _run(pipe, monkeypatch, registry, calls, *, timeout=60.0, batch_timeout=120.0, idle_timeout=None,
+               on_complete=None):
     """Run one turn's calls through the real queue, workers, batch executor and retry wrapper.
 
     Returns the outputs by call_id and how many (virtual) seconds the turn took.
@@ -196,6 +197,7 @@ async def _run(pipe, monkeypatch, registry, calls, *, timeout=60.0, batch_timeou
         event_emitter=None,
         batch_cap=4,
     )
+    context.on_complete = on_complete
     executor = pipe._ensure_tool_executor()
     context.workers.extend(asyncio.create_task(executor._tool_worker_loop(context)) for _ in range(5))
     token = pipe._TOOL_CONTEXT.set(context)
@@ -711,6 +713,49 @@ async def test_a_tool_failure_that_is_not_an_exception_tells_the_model_what_happ
     outputs, _ = await _run(pipe_instance_async, monkeypatch, registry, [_call("c1", "fetch")])
 
     assert reported in _text(outputs["c1"])
+
+
+def _takes(seconds: float, name: str, trace: list):
+    async def tool(**_kwargs):
+        await asyncio.sleep(seconds * SCALE)
+        trace.append(name)
+        return f"{name} done"
+
+    return tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("order", "lookup_card_at"),
+    [(("lookup", "render"), 5.0), (("render", "lookup"), 250.0)],
+    ids=["fast-call-first", "fast-call-second"],
+)
+async def test_a_tool_card_waits_only_for_the_calls_before_it_in_the_round(
+    pipe_instance_async, monkeypatch, order, lookup_card_at
+):
+    # A call's card is emitted once that call and every call BEFORE it in the round have finished -- cards
+    # follow call order. What it must not do is wait for a slower call that comes after it.
+    trace: list[str] = []
+    registry = {
+        "lookup": _entry(_takes(5, "lookup", trace), tool_type="function", name="lookup"),
+        "render": _entry(_takes(250, "render", trace), tool_type="function", name="render"),
+    }
+    cards: dict[str, float] = {}
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    async def on_complete(call, _result):
+        cards[str(call.get("name"))] = round((loop.time() - started) / SCALE, 1)
+
+    await _run(
+        pipe_instance_async, monkeypatch, registry,
+        [_call(f"c{i}", name) for i, name in enumerate(order)],
+        timeout=600.0, batch_timeout=900.0, on_complete=on_complete,
+    )
+
+    assert trace == ["lookup", "render"], trace
+    assert cards["lookup"] == lookup_card_at, cards
+    assert cards["render"] == 250.0, cards
 
 
 # --- the default limits leave room for long tools --------------------------------------------------------------------
@@ -1406,6 +1451,74 @@ async def test_a_tool_that_keeps_timing_out_is_skipped_once_its_failures_run_in_
 
     assert trace.count("asked") == threshold
     assert "skipped due to repeated failures" in _text(outputs[-1])
+
+
+def _cancels_itself(trace: list[str]):
+    """A tool that awaits something another caller cancelled, so CancelledError escapes without the pipe cutting it."""
+
+    async def fetch(**_kwargs):
+        trace.append("ran")
+        future = asyncio.get_running_loop().create_future()
+        future.cancel()
+        return await future
+
+    return fetch
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("threshold", [2, 3])
+async def test_a_tool_that_keeps_cancelling_itself_is_skipped_once_its_failures_run_in_a_row(
+    pipe_instance_async, monkeypatch, threshold
+):
+    # The model is told this call failed, so it has to count against the tool like any other failure. Only the
+    # cancellations the pipe itself causes -- a batch deadline, request shutdown -- are exempt.
+    pipe = pipe_instance_async
+    pipe._circuit_breaker.threshold = threshold
+    pipe._circuit_breaker.window_seconds = 600
+    monkeypatch.setattr(circuit_breaker_module, "time", _VirtualTime(asyncio.get_running_loop()))
+    trace: list[str] = []
+    registry = {"fetch": _entry(_cancels_itself(trace), tool_type="function", name="fetch")}
+
+    outputs, per_round = [], []
+    for index in range(threshold + 1):
+        before = len(trace)
+        result, _ = await _run(pipe, monkeypatch, registry, [_call(f"c{index}", "fetch")])
+        per_round.append(len(trace) - before)
+        outputs.append(result[f"c{index}"])
+
+    assert per_round[-1] == 0, per_round
+    assert all(count > 0 for count in per_round[:-1]), per_round
+    assert "skipped due to repeated failures" in _text(outputs[-1]), _text(outputs[-1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("builtin", "still_allowed"),
+    [(True, True), (False, False)],
+    ids=["open-webuis-ask_user", "a-users-own-tool-of-the-same-name"],
+)
+async def test_only_a_real_tool_is_counted_when_it_cancels_itself(
+    pipe_instance_async, monkeypatch, builtin, still_allowed
+):
+    # `ask_user` waits on a person, so the pipe holds nothing against it -- the same exemption its timeout
+    # already gets. Every other tool that cancels itself is a failure like any other, including one a user
+    # happens to have named `ask_user`.
+    pipe = pipe_instance_async
+    pipe._circuit_breaker.threshold = 1
+    pipe._circuit_breaker.window_seconds = 600
+    monkeypatch.setattr(circuit_breaker_module, "time", _VirtualTime(asyncio.get_running_loop()))
+    trace: list[str] = []
+    entry = (
+        _builtin_ask_user(_cancels_itself(trace))
+        if builtin
+        else _entry(_cancels_itself(trace), tool_type="function", name="ask_user")
+    )
+
+    await _run(pipe, monkeypatch, {"ask_user": entry}, [_call("c1", "ask_user", _ask(90_000))])
+
+    assert trace == ["ran"], trace
+    tool_type = "builtin" if builtin else "function"
+    assert pipe._circuit_breaker.tool_allows("user-1", tool_type, "ask_user") is still_allowed
 
 
 @pytest.mark.asyncio
