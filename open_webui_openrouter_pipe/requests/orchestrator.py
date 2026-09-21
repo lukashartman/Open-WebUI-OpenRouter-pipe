@@ -34,7 +34,6 @@ from ..core.logging_system import SessionLogger
 from ..core.timing_logger import timed
 from ..core.utils import (
     _select_best_effort_fallback,
-    brings_tool_results,
     continued_turn_counts,
 )
 from ..core.warn_latch import warn_level
@@ -72,64 +71,6 @@ if TYPE_CHECKING:
 
 
 from ..models.registry import uses_dedicated_image_api
-
-
-def _resent_message_key(message: Any) -> tuple[Any, ...]:
-    if not isinstance(message, dict):
-        return (repr(message),)
-    content = message.get("content")
-    calls = tuple(
-        (call.get("id"), json.dumps(call.get("function"), sort_keys=True))
-        for call in message.get("tool_calls") or []
-        if isinstance(call, dict)
-    )
-    return (
-        message.get("role"),
-        content if isinstance(content, str) else json.dumps(content, sort_keys=True),
-        calls,
-        message.get("tool_call_id"),
-    )
-
-
-def _extends_resent_message(first: Any, repeat: Any) -> bool:
-    if not isinstance(first, dict) or not isinstance(repeat, dict):
-        return False
-    if first.get("role") != "assistant":
-        return _resent_message_key(first) == _resent_message_key(repeat)
-    first_text, repeat_text = first.get("content") or "", repeat.get("content") or ""
-    first_calls = [call.get("id") for call in first.get("tool_calls") or [] if isinstance(call, dict)]
-    repeat_calls = [call.get("id") for call in repeat.get("tool_calls") or [] if isinstance(call, dict)]
-    return (
-        repeat.get("role") == "assistant"
-        and isinstance(first_text, str)
-        and isinstance(repeat_text, str)
-        and repeat_text.startswith(first_text)
-        and repeat_calls[: len(first_calls)] == first_calls
-    )
-
-
-def _without_resent_continued_turn(messages: list[Any]) -> list[Any]:
-    if not brings_tool_results({"messages": messages}):
-        return messages
-    start = None
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        after_tool = index > 0 and isinstance(messages[index - 1], dict) and messages[index - 1].get("role") == "tool"
-        if isinstance(message, dict) and message.get("role") == "user" and not after_tool:
-            start = index + 1
-            break
-    if start is None or start >= len(messages) or not isinstance(messages[start], dict):
-        return messages
-    if messages[start].get("role") != "assistant":
-        return messages
-    for size in range((len(messages) - start - 1) // 2, 0, -1):
-        first = messages[start : start + size]
-        repeat = messages[start + size : start + 2 * size]
-        if [_resent_message_key(m) for m in first[:-1]] != [_resent_message_key(m) for m in repeat[:-1]]:
-            continue
-        if _extends_resent_message(first[-1], repeat[-1]):
-            return messages[:start] + messages[start + size :]
-    return messages
 
 
 def _inject_image_modalities(
@@ -719,8 +660,6 @@ class RequestOrchestrator:
 
         _inject_image_modalities(body, logger=self.logger)
 
-        if __metadata__.get("assistant_message_id") and isinstance(body.get("messages"), list):
-            body = {**body, "messages": _without_resent_continued_turn(body["messages"])}
         completions_body = CompletionsBody.model_validate(body)
 
         vvb = virtual_variant_bases or {}

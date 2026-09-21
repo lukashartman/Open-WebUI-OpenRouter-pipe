@@ -544,6 +544,42 @@ def _statuses(items: list[Any]) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["", "Half an answer. "], ids=["nothing-streamed", "text-streamed"])
+async def test_a_stream_that_just_stops_also_closes_the_progress_line(pipe_instance_async, text) -> None:
+    """The same rule as the failure cards below, on the path that has no exception to report.
+
+    A stream can end without its terminal event, and the notice the pipe appends says so. Until that notice is
+    the last word the person is left reading "Thinking..." or "Responding to the user...", saved into the
+    message, describing work that stopped. The stale line differs between the two arms, which is why both run.
+    """
+    pipe = pipe_instance_async
+    pipe.valves.STREAM_INTERRUPTED_TEMPLATE = "### Response interrupted"
+
+    async def source() -> Any:
+        yield {"type": "response.created", "response": {"model": MODEL}}
+        if text:
+            yield {"type": "response.output_text.delta", "delta": text}
+
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    await pipe._streaming_handler._run_streaming_loop(
+        ResponsesBody(model=MODEL, input=[], stream=True),
+        pipe.valves,
+        _stream_emitter(pipe, queue),
+        {},
+        {},
+        session=cast(Any, _NoSession()),
+        user_id="u",
+        event_source=source(),
+    )
+    items = _drain(queue)
+
+    assert "Response interrupted" in _content(items), _content(items)
+    statuses = _statuses(items)
+    assert statuses, "the turn emitted no status at all"
+    assert statuses[-1].get("done") is True, statuses
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failure", "valve", "template", "marker"),
     [

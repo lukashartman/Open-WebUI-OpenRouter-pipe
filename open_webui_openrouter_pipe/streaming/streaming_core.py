@@ -11,7 +11,6 @@ import base64
 import binascii
 import contextlib
 import copy
-import datetime
 import inspect
 import json
 import logging
@@ -19,7 +18,6 @@ import random
 import re
 import time
 import uuid
-from collections import Counter
 from collections.abc import AsyncGenerator
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal
@@ -88,7 +86,6 @@ from ..core.utils import (
     SERVER_TOOL_SUCCESS_STATUSES,
     TOOL_ROUND_SKELETON_KEY,
     _redact_payload_blobs,
-    _render_error_template,
     _safe_json_loads,
     _serialize_marker,
     _serialize_phase_marker,
@@ -562,36 +559,9 @@ class StreamingHandler:
                 for item in body.input
             )
         open_webui_keeps_stored_output = bool(metadata.get("assistant_message_id"))
-        turn_result_call_ids: Counter[str] = Counter()
-        if owui_tool_passthrough and isinstance(body.input, list):
-            result_scope: list[dict[str, Any]] = []
-            scanned = [item for item in body.input if isinstance(item, dict)]
-            for index, item in enumerate(scanned):
-                if item.get("type") == "message" and item.get("role") == "user":
-                    following = scanned[index + 1] if index + 1 < len(scanned) else None
-                    carries_the_rounds_images = (
-                        bool(result_scope)
-                        and result_scope[-1].get("type") == "function_call_output"
-                        and (following is None or following.get("type") == "function_call")
-                    )
-                    if carries_the_rounds_images:
-                        continue
-                    result_scope = []
-                else:
-                    result_scope.append(item)
-            turn_result_call_ids = Counter(
-                item["call_id"]
-                for item in result_scope
-                if item.get("type") == "function_call_output" and isinstance(item.get("call_id"), str)
-            )
         earlier_turn_calls, earlier_turn_texts, continues_after_reasoning = (
             body._continued_turn if body._continued_turn is not None else continued_turn_counts(body.input)
         )
-        open_webui_keeps_earlier_generations = bool(body.stream)
-        if not open_webui_keeps_earlier_generations:
-            earlier_turn_calls = 0
-            earlier_turn_texts = 0
-            continues_after_reasoning = False
         self.logger.debug(
             "🔧 TOOL_EXECUTION_MODE=%s owui_passthrough=%s PERSIST_TOOL_RESULTS=%s effective_persist_tools=%s is_continuation=%s",
             valves.TOOL_EXECUTION_MODE,
@@ -971,13 +941,7 @@ class StreamingHandler:
                     stored_items = [
                         copy.deepcopy(entry) for entry in prior if isinstance(entry, dict)
                     ]
-                    stored_result_call_ids = Counter(
-                        entry["call_id"]
-                        for entry in stored_items
-                        if entry.get("type") == "function_call_output" and isinstance(entry.get("call_id"), str)
-                    )
-                    if turn_result_call_ids <= stored_result_call_ids:
-                        seeded_output_items = stored_items
+                    seeded_output_items = stored_items
             return seeded_output_items
 
         def _flush_recorded_message() -> None:
@@ -1446,7 +1410,6 @@ class StreamingHandler:
             outcome_sink["reason"] = session_log_reason or None
 
         try:
-            await _capture_seeded_output()
             for loop_index in range(valves.MAX_FUNCTION_CALL_LOOPS + 1):
                 if loop_index >= valves.MAX_FUNCTION_CALL_LOOPS and not loop_limit_reached:
                     break
@@ -2431,32 +2394,29 @@ class StreamingHandler:
 
                 if final_response is None:
                     error_occurred = not fusion_inner_call
-                    self.logger.warning("Stream ended without completion event for model=%s", body.model)
-                    try:
-                        template_vars = {
-                            "model": body.model or "",
-                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
-                            "support_email": valves.SUPPORT_EMAIL,
-                            "support_url": valves.SUPPORT_URL,
-                        }
-                        try:
-                            notice = _render_error_template(valves.STREAM_INTERRUPTED_TEMPLATE, template_vars)
-                        except Exception:
-                            self.logger.debug("Custom STREAM_INTERRUPTED_TEMPLATE failed to render; using default", exc_info=True)
-                            notice = _render_error_template(DEFAULT_STREAM_INTERRUPTED_TEMPLATE, template_vars)
-                        if notice and not fusion_inner_call:
-                            joined = join_answer_and_card(assistant_message, notice)
-                            delta = joined[len(assistant_message):]
-                            assistant_message = joined
-                            if event_emitter:
-                                await event_emitter({"type": "chat:message:delta", "data": {"content": delta}})
-                    except Exception:
-                        self.logger.debug("Failed to render stream interrupted template", exc_info=True)
-                    if event_emitter:
+                    if fusion_inner_call:
+                        self.logger.warning("Stream ended without completion event for model=%s", body.model)
+                        if event_emitter:
+                            await self._pipe._event_emitter_handler._emit_completion(
+                                event_emitter,
+                                content=None if fusion_armed else assistant_message,
+                                done=True,
+                            )
+                        break
+                    reported = await self._pipe._ensure_error_formatter()._emit_templated_error(
+                        event_emitter,
+                        template=valves.STREAM_INTERRUPTED_TEMPLATE,
+                        variables={"model": body.model or ""},
+                        log_message=f"Stream ended without completion event for model={body.model}",
+                        log_level=logging.WARNING,
+                        partial_answer=assistant_message,
+                        fallback_template=DEFAULT_STREAM_INTERRUPTED_TEMPLATE,
+                    )
+                    if reported:
+                        assistant_message = reported
+                    if event_emitter and fusion_armed:
                         await self._pipe._event_emitter_handler._emit_completion(
-                            event_emitter,
-                            content=None if fusion_armed else assistant_message,
-                            done=True,
+                            event_emitter, content=None, done=True
                         )
                     break
 
@@ -3357,9 +3317,7 @@ class StreamingHandler:
                     self.logger.debug("generation-complete dispatch failed", exc_info=True)
 
             if (not error_occurred) and (not was_cancelled):
-                await self._cleanup_replayed_reasoning(
-                    body, valves, message_id if open_webui_keeps_earlier_generations else None
-                )
+                await self._cleanup_replayed_reasoning(body, valves, message_id)
             if (not error_occurred) and (not was_cancelled) and event_emitter:
                 effective_start = stream_started_at or request_started_at
                 elapsed = max(0.0, perf_counter() - effective_start)

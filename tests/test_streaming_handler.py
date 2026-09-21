@@ -458,16 +458,20 @@ class TestStreamingLoopBasic:
         assert "Hello" in result
         assert "Response interrupted" in result
 
-        deltas = [e for e in emitted if e.get("type") == "chat:message:delta"]
-        delta_contents = "".join(d.get("data", {}).get("content", "") for d in deltas)
-        assert "Response interrupted" in delta_contents
+        # The notice is delivered the way every other failure card is: one `chat:message` carrying the answer
+        # so far plus the card, a closing status, and a bare completion.
+        messages = [e for e in emitted if e.get("type") == "chat:message"]
+        assert messages, emitted
+        shown = messages[-1].get("data", {}).get("content", "")
+        assert "Hello" in shown
+        assert "Response interrupted" in shown
+
+        statuses = [e for e in emitted if e.get("type") == "status"]
+        assert statuses and statuses[-1].get("data", {}).get("done") is True, statuses
 
         completions = [e for e in emitted if e.get("type") == "chat:completion"]
         assert len(completions) >= 1
-        last_completion = completions[-1]
-        completion_content = last_completion.get("data", {}).get("content", "")
-        assert "Hello" in completion_content
-        assert "Response interrupted" in completion_content
+        assert completions[-1].get("data", {}).get("done") is True, completions
 
     @pytest.mark.asyncio
     async def test_streaming_loop_multiple_text_deltas(self, monkeypatch, pipe_instance_async):

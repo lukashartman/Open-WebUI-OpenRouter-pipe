@@ -351,14 +351,11 @@ async def test_next_reply_cleanup_keeps_the_rows_of_the_message_a_continue_is_st
 
 # --- a Continue that is not streamed -----------------------------------------------------------------------------------
 
-# Without streaming Open WebUI stores only the content a request returns, replacing what the message held, so after a
-# Continue the message holds the continuation alone.
-NOT_STREAMED = {
-    "tools-then-tools": ["user:q1", "assistant:Part two.", "BEFORE-B", "call-b", "result:call-b", "AFTER-B", "user:q2"],
-    "answer-then-answer": ["user:q1", "THINK-B", "assistant:Part two.", "user:q2"],
-    "tools-then-answer": ["user:q1", "THINK-B", "assistant:Part two.", "user:q2"],
-    "answer-then-tools": ["user:q1", "assistant:Part two.", "BEFORE-B", "call-b", "result:call-b", "AFTER-B", "user:q2"],
-}
+# Open WebUI keeps the first generation on a Continue whether or not the request streamed: its non-streaming
+# handler rebuilds the stored output, merges the continued message with the new one, and saves
+# `previous + response_output`. So a Continue that did not stream replays the whole turn, exactly as a streamed
+# one does. Open WebUI 0.11.3 stored only the continuation here; upstream fixed that, so no arm asserts the
+# old shape.
 
 
 @pytest.mark.asyncio
@@ -367,13 +364,13 @@ NOT_STREAMED = {
     "listing", ["with-reasoning", "without-reasoning"],
     ids=["completion-lists-the-reasoning", "completion-omits-the-reasoning"],
 )
-@pytest.mark.parametrize("shape", list(NOT_STREAMED))
-async def test_a_continue_that_is_not_streamed_places_its_reasoning_within_the_continuation_open_webui_stores(
+@pytest.mark.parametrize("shape", list(SHAPES))
+async def test_a_continue_that_is_not_streamed_replays_the_whole_turn_just_as_a_streamed_one_does(
     monkeypatch, pipe_instance_async, shape, listing, results_kept
 ):
     pipe = pipe_instance_async
     valves = _valves(pipe).model_copy(update={"PERSIST_TOOL_RESULTS": results_kept})
-    first_rounds, second_rounds, _ = SHAPES[shape]
+    first_rounds, second_rounds, expected = SHAPES[shape]
     persisted: dict[str, dict[str, Any]] = {}
     history = [{"role": "user", "content": "q1"}]
     first = await _generation(
@@ -389,10 +386,11 @@ async def test_a_continue_that_is_not_streamed_places_its_reasoning_within_the_c
 
     replay = await _replay(
         pipe, valves, persisted,
-        [*history, {"role": "assistant", "message_id": "m1", "content": second}, {"role": "user", "content": "q2"}],
+        [*history, {"role": "assistant", "message_id": "m1", "content": first + second},
+         {"role": "user", "content": "q2"}],
     )
 
-    assert [_label(item) for item in replay] == NOT_STREAMED[shape]
+    _assert_replays_exactly_and_apart(replay, expected)
 
 
 @pytest.mark.asyncio
@@ -401,8 +399,8 @@ async def test_a_continue_that_is_not_streamed_places_its_reasoning_within_the_c
 async def test_after_a_continue_the_next_reply_leaves_none_of_the_continued_messages_rows(
     monkeypatch, pipe_instance_async, shape, stream
 ):
-    """Under next_reply a message's rows are gone once the reply after it finishes. Without streaming, Open WebUI keeps
-    only what the Continue returned, so nothing later refers to the first generation's rows."""
+    """Under next_reply a message's rows are gone once the reply after it finishes. Open WebUI keeps the whole
+    continued message whether or not the request streamed, so both arms store both generations."""
     pipe = pipe_instance_async
     valves = _valves(pipe).model_copy(update={"PERSIST_REASONING_TOKENS": "next_reply", "PERSIST_TOOL_RESULTS": False})
     first_rounds, second_rounds, _ = SHAPES[shape]
@@ -421,7 +419,7 @@ async def test_after_a_continue_the_next_reply_leaves_none_of_the_continued_mess
         first = await reply(history, first_rounds, "m1", continued=False)
         assert _rows_of(store, "m1") > 0
         second = await reply([*history, {"role": "assistant", "content": first}], second_rounds, "m1", continued=True)
-        stored = first + second if stream else second
+        stored = first + second
         await reply(
             [*history, {"role": "assistant", "content": stored}, {"role": "user", "content": "q2"}],
             [("answer", "THINK-0", "Next answer.")], "m2", continued=False,
