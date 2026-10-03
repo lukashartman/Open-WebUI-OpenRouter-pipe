@@ -52,3 +52,10 @@ open_webui_openrouter_pipe = ["py.typed"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["pytest_bootstrap.py"]
+
+[tool.ruff.lint]
+# Pin the rule selection explicitly. CI installs ruff unpinned, and ruff's
+# built-in default rule set broadened over time, which silently turned the
+# lint job red on pre-existing code. Selecting the long-standing default
+# (E4/E7/E9/F) keeps lint results deterministic across ruff versions.
+select = ["E4", "E7", "E9", "F"]
