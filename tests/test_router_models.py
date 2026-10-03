@@ -8,9 +8,11 @@ import logging
 from typing import Any
 
 import pytest
+from aioresponses import aioresponses
+from aioresponses.core import CallbackResult
 
 from open_webui_openrouter_pipe.models.registry import OpenRouterModelRegistry
-from open_webui_openrouter_pipe.pipe import Pipe
+from open_webui_openrouter_pipe.pipe import EncryptedStr, Pipe
 
 
 class _DummyResponse:
@@ -287,3 +289,79 @@ async def test_restriction_reason_present_for_unlisted_router():
         catalog_norm_ids={"typesafe.jev-router", "openai.gpt-5"},
     )
     assert "ZDR_MODELS_ONLY" in reasons
+
+
+_ROUTER_SSE = (
+    'data: {"type":"response.output_text.delta","delta":"OK"}\n\n'
+    'data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":5,"output_tokens":3}}}\n\n'
+)
+
+
+async def _consume(result) -> None:
+    if hasattr(result, "__aiter__"):
+        async for _chunk in result:
+            pass
+
+
+async def _run_zdr_request(valve_router_ids: str):
+    pipe = Pipe()
+    try:
+        pipe.valves.API_KEY = EncryptedStr("test-api-key")
+        pipe.valves.BASE_URL = "https://openrouter.ai/api/v1"
+        pipe.valves.ZDR_ENFORCE = True
+        pipe.valves.ZDR_ROUTER_MODELS = valve_router_ids
+
+        captured: list[dict] = []
+
+        def callback(url, **kwargs):
+            captured.append(kwargs.get("json", {}))
+            return CallbackResult(
+                body=_ROUTER_SSE.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+                status=200,
+            )
+
+        async def event_emitter(event):
+            pass
+
+        with aioresponses() as mock_http:
+            mock_http.post("https://openrouter.ai/api/v1/responses", callback=callback, repeat=True)
+            mock_http.get(
+                "https://openrouter.ai/api/v1/models",
+                payload={"data": [ROUTER_MODEL]},
+                repeat=True,
+            )
+            mock_http.get(
+                "https://openrouter.ai/api/v1/endpoints/zdr",
+                payload={"data": []},
+                repeat=True,
+            )
+            result = await pipe.pipe(
+                body={"model": "typesafe/jev-router",
+                      "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                __user__={"id": "user_123"},
+                __request__=None,
+                __event_emitter__=event_emitter,
+                __event_call__=None,
+                __metadata__={"model": {"id": "typesafe/jev-router"}},
+                __tools__=None,
+                __task__=None,
+                __task_body__=None,
+            )
+            await _consume(result)
+        return captured
+    finally:
+        await pipe.close()
+
+
+@pytest.mark.asyncio
+async def test_enforce_zdr_admits_listed_router():
+    captured = await _run_zdr_request("typesafe/jev-router")
+    assert captured, "Expected the router request to be sent"
+    assert (captured[-1].get("provider") or {}).get("zdr") is True
+
+
+@pytest.mark.asyncio
+async def test_enforce_zdr_rejects_unlisted_router():
+    captured = await _run_zdr_request("")
+    assert captured == [], "An unlisted router must be rejected before any request is sent"
