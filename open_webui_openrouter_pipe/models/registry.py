@@ -345,6 +345,7 @@ class OpenRouterModelRegistry:
                 architecture,
                 pricing,
             )
+            is_router = cls._detect_router(architecture, pricing)
 
             max_completion_tokens: Optional[int] = None
             top_provider = full_model.get("top_provider")
@@ -356,6 +357,7 @@ class OpenRouterModelRegistry:
                 # Derived features for fast capability checks
                 "features": features,
                 "capabilities": capabilities,
+                "is_router": is_router,
                 "max_completion_tokens": max_completion_tokens,
                 "supported_parameters": frozenset(supported_parameters),
 
@@ -526,6 +528,25 @@ class OpenRouterModelRegistry:
             numeric = [c for c in candidates if c is not None]
             return max(numeric) if numeric else None
         return None
+
+    @staticmethod
+    def _detect_router(architecture: Dict[str, Any], pricing: Dict[str, Any]) -> bool:
+        """Return True when a catalog entry is a router-class model.
+
+        Router-class means the entry's own price is a selection-step sentinel
+        (negative), or it is a zero-priced entry whose tokenizer is the router
+        tokenizer. ``~provider/model-latest`` aliases carry real non-zero
+        pricing, so they are deliberately excluded.
+        """
+        coerce = OpenRouterModelRegistry._coerce_pricing_number
+        prompt = coerce(pricing.get("prompt"))
+        completion = coerce(pricing.get("completion"))
+        if prompt is not None and prompt < Decimal(0):
+            return True
+        tokenizer = architecture.get("tokenizer")
+        if not isinstance(tokenizer, str) or tokenizer.strip().lower() != "router":
+            return False
+        return prompt == Decimal(0) and completion == Decimal(0)
 
     @staticmethod
     def _supports_web_search(pricing: Dict[str, Any]) -> bool:
@@ -956,6 +977,20 @@ class OpenRouterModelRegistry:
         if cls._zdr_model_ids is None:
             return None
         return norm in cls._zdr_model_ids
+
+    @classmethod
+    def is_router_model(cls, model_id: str) -> bool:
+        """Return True when ``model_id`` resolves to a router-class catalog entry.
+
+        Variant suffixes (``:nitro`` and friends) resolve to their base entry.
+        Unknown ids and models without catalog metadata return False.
+        """
+        norm = ModelFamily.base_model(model_id)
+        if not norm:
+            return False
+        base_norm = norm.rsplit(":", 1)[0] if ":" in norm else norm
+        spec = cls._specs.get(base_norm) or {}
+        return bool(spec.get("is_router"))
 
     @classmethod
     @timed
