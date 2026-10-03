@@ -1228,6 +1228,14 @@ def is_free_model(model_norm_id: str) -> bool:
         True if model exists and all pricing values sum to zero
     """
     pricing = OpenRouterModelRegistry.spec(model_norm_id).get("pricing") or {}
+    coerce = OpenRouterModelRegistry._coerce_pricing_number
+    prompt = coerce(pricing.get("prompt"))
+    completion = coerce(pricing.get("completion"))
+    if (prompt is not None and prompt < Decimal(0)) or (
+        completion is not None and completion < Decimal(0)
+    ):
+        # Selection-step sentinel pricing (e.g. -1/-1 on a router): never free.
+        return False
     total, numeric_count = sum_pricing_values(pricing)
     if numeric_count <= 0:
         return False

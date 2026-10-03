@@ -171,3 +171,28 @@ async def test_variant_suffix_resolves_to_base_router():
 def test_unknown_id_is_not_router():
     assert OpenRouterModelRegistry.is_router_model("nobody/unknown") is False
     assert OpenRouterModelRegistry.is_router_model("") is False
+
+
+@pytest.mark.asyncio
+async def test_negative_priced_router_is_not_free():
+    await _load_catalog()
+    from open_webui_openrouter_pipe.models.registry import is_free_model
+
+    assert is_free_model("typesafe.jev-router") is False
+
+
+@pytest.mark.asyncio
+async def test_zero_priced_router_still_free():
+    await _load_catalog()
+    from open_webui_openrouter_pipe.models.registry import is_free_model
+
+    assert is_free_model("openrouter.free") is True
+
+
+@pytest.mark.asyncio
+async def test_missing_pricing_is_not_free():
+    """Review Focus 4: absent pricing is False, not a crash."""
+    await _load_catalog()
+    from open_webui_openrouter_pipe.models.registry import is_free_model
+
+    assert is_free_model("example.no-pricing") is False
