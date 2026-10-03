@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from ..pipe import Pipe
     from ..api.transforms import ResponsesBody
 
-from .registry import ModelFamily
+from .registry import ModelFamily, OpenRouterModelRegistry
 from ..core.errors import OpenRouterAPIError
 from ..integrations.anthropic import _is_anthropic_model_id
 
@@ -60,6 +60,9 @@ class ReasoningConfigManager:
             requested_summary = summary_mode
 
         target_effort = valves.REASONING_EFFORT
+        if supports_reasoning and OpenRouterModelRegistry.is_router_model(responses_body.model):
+            # The router selects its own reasoning effort; ask for traces only.
+            target_effort = None
 
         if supports_reasoning:
             cfg: dict[str, Any] = {}
@@ -98,7 +101,11 @@ class ReasoningConfigManager:
                 else {}
             )
             cfg = dict(cfg) if cfg else {}
-            cfg["effort"] = target_effort
+            if OpenRouterModelRegistry.is_router_model(responses_body.model):
+                # Leave the router to pick its own effort; a task override would fight it.
+                pass
+            else:
+                cfg["effort"] = target_effort
             cfg.setdefault("enabled", True)
             responses_body.reasoning = cfg
             if getattr(responses_body, "include_reasoning", None) is not None:

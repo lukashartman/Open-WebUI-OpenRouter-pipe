@@ -11,6 +11,7 @@ import pytest
 from aioresponses import aioresponses
 from aioresponses.core import CallbackResult
 
+from open_webui_openrouter_pipe.api.transforms import ResponsesBody
 from open_webui_openrouter_pipe.models.registry import OpenRouterModelRegistry
 from open_webui_openrouter_pipe.pipe import EncryptedStr, Pipe
 
@@ -365,3 +366,62 @@ async def test_enforce_zdr_admits_listed_router():
 async def test_enforce_zdr_rejects_unlisted_router():
     captured = await _run_zdr_request("")
     assert captured == [], "An unlisted router must be rejected before any request is sent"
+
+
+@pytest.mark.asyncio
+async def test_router_receives_no_injected_effort():
+    await _load_catalog()
+    pipe = Pipe()
+    pipe.valves.ENABLE_REASONING = True
+    pipe.valves.REASONING_EFFORT = "medium"
+    pipe.valves.REASONING_SUMMARY_MODE = "auto"
+    mgr = pipe._ensure_reasoning_config_manager()
+
+    body = ResponsesBody(model="typesafe/jev-router", input=[])
+    mgr._apply_reasoning_preferences(body, pipe.valves)
+
+    assert isinstance(body.reasoning, dict)
+    assert "effort" not in body.reasoning
+    assert body.reasoning.get("summary") == "auto"
+    assert body.reasoning.get("enabled") is True
+
+
+@pytest.mark.asyncio
+async def test_router_preserves_explicit_effort():
+    await _load_catalog()
+    pipe = Pipe()
+    pipe.valves.ENABLE_REASONING = True
+    pipe.valves.REASONING_EFFORT = "medium"
+    mgr = pipe._ensure_reasoning_config_manager()
+
+    body = ResponsesBody(model="typesafe/jev-router", reasoning={"effort": "high"}, input=[])
+    mgr._apply_reasoning_preferences(body, pipe.valves)
+
+    assert body.reasoning.get("effort") == "high"
+
+
+@pytest.mark.asyncio
+async def test_non_router_still_receives_valve_effort():
+    await _load_catalog()
+    pipe = Pipe()
+    pipe.valves.ENABLE_REASONING = True
+    pipe.valves.REASONING_EFFORT = "medium"
+    mgr = pipe._ensure_reasoning_config_manager()
+
+    body = ResponsesBody(model="openai/gpt-5", input=[])
+    mgr._apply_reasoning_preferences(body, pipe.valves)
+
+    assert body.reasoning.get("effort") == "medium"
+
+
+@pytest.mark.asyncio
+async def test_task_reasoning_leaves_router_effort_unset():
+    await _load_catalog()
+    pipe = Pipe()
+    mgr = pipe._ensure_reasoning_config_manager()
+
+    body = ResponsesBody(model="typesafe/jev-router", input=[])
+    mgr._apply_task_reasoning_preferences(body, "high")
+
+    assert "effort" not in (body.reasoning or {})
+    assert (body.reasoning or {}).get("enabled") is True
