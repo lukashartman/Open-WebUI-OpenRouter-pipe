@@ -977,6 +977,11 @@ CONFIG_META: dict[str, dict[str, str]] = {
         "group": "Models & Catalog/ZDR",
         "detail": "Trims the model picker to only OpenRouter's Zero Data Retention models — those served by an endpoint that keeps no copy of the prompt or reply.\n\nLike any catalog filter, a hidden model also can't be reached directly: a request to one returns the `Blocked model message`. What it does not do is ask OpenRouter to route with ZDR — it curates the list but sends no `provider.zdr=true`, trusting the published ZDR list rather than enforcing per request. Use `Enforce ZDR routing` for that guarantee.\n\n**Warning:** If OpenRouter's ZDR list can't be loaded, filtering is skipped and every model stays visible and usable — it fails open, the opposite of `Enforce ZDR routing`."
     },
+    "ZDR_ROUTER_MODELS": {
+        "title": "Admit routers through ZDR",
+        "group": "Models & Catalog/ZDR",
+        "detail": "Lets named Router-class models stay selectable while `Show only ZDR models` is on and keeps them callable under `Enforce ZDR routing`.\n\nRouter-class models (`typesafe/jev-router`, `openrouter/auto`, `openrouter/free`, and similar) serve a single id that picks a different downstream model per request. They expose no provider endpoints at all, so the published ZDR list never contains them and both ZDR controls would otherwise hide or reject them. List one per line as a comma-separated slug to opt it in; a listed router is sent with `provider.zdr=true` under enforcement.\n\n**Warning:** This is best-effort. The ZDR guarantee covers the routing step only; the downstream model the router selects is a separate data path that OpenRouter does not promise is ZDR. Leave empty to keep the default conservative behaviour."
+    },
     "PIPE_DASHBOARD_ENABLE": {
         "title": "Enable Pipe Dashboard",
         "group": "Plugins/Pipe Dashboard",

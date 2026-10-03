@@ -1128,6 +1128,40 @@ def _parse_model_patterns(value: Any) -> list[str]:
 
 
 # -----------------------------------------------------------------------------
+# ZDR Router Opt-In Helpers
+# -----------------------------------------------------------------------------
+
+
+def _zdr_router_base_norm(model_id: Any) -> str:
+    """Return the sanitized, variant-stripped base norm id for a router id."""
+    norm = ModelFamily.base_model(sanitize_model_id(str(model_id or "")))
+    return norm.rsplit(":", 1)[0] if ":" in norm else norm
+
+
+def parse_zdr_router_valve(value: Any) -> set[str]:
+    """Normalize the ZDR_ROUTER_MODELS CSV into a set of base norm ids."""
+    if not value:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        entries = [str(entry) for entry in value]
+    else:
+        entries = str(value).split(",")
+    parsed: set[str] = set()
+    for entry in entries:
+        base = _zdr_router_base_norm(entry.strip())
+        if base:
+            parsed.add(base)
+    return parsed
+
+
+def router_is_zdr_opted_in(model_id: Any, valve_value: Any) -> bool:
+    """True when ``model_id`` is a router explicitly listed in ZDR_ROUTER_MODELS."""
+    if not OpenRouterModelRegistry.is_router_model(str(model_id or "")):
+        return False
+    return _zdr_router_base_norm(model_id) in parse_zdr_router_valve(valve_value)
+
+
+# -----------------------------------------------------------------------------
 # Pricing Helpers
 # -----------------------------------------------------------------------------
 

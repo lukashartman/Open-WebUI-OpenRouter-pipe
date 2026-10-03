@@ -887,6 +887,18 @@ class Valves(BaseModel):
             "If Enforce ZDR is enabled, user overrides are ignored."
         ),
     )
+    ZDR_ROUTER_MODELS: str = Field(
+        default="",
+        title="ZDR router opt-in",
+        description=(
+            "Comma-separated list of router-class models (for example 'typesafe/jev-router') "
+            "to admit through the ZDR filters. Router-class models expose no ZDR endpoints, so "
+            "'ZDR models only' hides them and 'Enforce ZDR' rejects them; listing one here makes "
+            "it selectable and, under enforcement, sends the request with provider.zdr=true. "
+            "This is best-effort: the router's downstream model is a separate data path that "
+            "OpenRouter does not guarantee is ZDR."
+        ),
+    )
     VARIANT_MODELS: str = Field(
         default="",
         title="Variant models",

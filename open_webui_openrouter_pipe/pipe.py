@@ -114,6 +114,7 @@ from .models.registry import (
     sanitize_model_id,
     is_free_model,
     supports_tool_calling,
+    router_is_zdr_opted_in,
 )
 from .tools.tool_executor import _QueuedToolCall, _ToolExecutionContext
 from .core.logging_system import SessionLogger
@@ -3070,11 +3071,17 @@ class Pipe:
                 spec_lookup_id = norm_id
 
             if zdr_only:
-                zdr_capable = OpenRouterModelRegistry.is_zdr_capable(norm_id)
-                if zdr_capable is False:
-                    continue
-                if zdr_capable is None and zdr_model_ids is not None and norm_id not in zdr_model_ids:
-                    continue
+                if OpenRouterModelRegistry.is_router_model(spec_lookup_id):
+                    # Routers have no ZDR endpoints; they are admitted only by
+                    # explicit opt-in and are never subject to endpoint membership.
+                    if not router_is_zdr_opted_in(spec_lookup_id, valves.ZDR_ROUTER_MODELS):
+                        continue
+                else:
+                    zdr_capable = OpenRouterModelRegistry.is_zdr_capable(norm_id)
+                    if zdr_capable is False:
+                        continue
+                    if zdr_capable is None and zdr_model_ids is not None and norm_id not in zdr_model_ids:
+                        continue
 
             if free_mode != "all":
                 is_free = is_free_model(spec_lookup_id)
@@ -3389,9 +3396,13 @@ class Pipe:
 
         zdr_only = valves.ZDR_MODELS_ONLY
         if zdr_only and spec_available:
-            zdr_capable = OpenRouterModelRegistry.is_zdr_capable(model_norm_id)
-            if zdr_capable is False:
-                reasons.append("ZDR_MODELS_ONLY")
+            if OpenRouterModelRegistry.is_router_model(model_norm_id):
+                if not router_is_zdr_opted_in(model_norm_id, valves.ZDR_ROUTER_MODELS):
+                    reasons.append("ZDR_MODELS_ONLY")
+            else:
+                zdr_capable = OpenRouterModelRegistry.is_zdr_capable(model_norm_id)
+                if zdr_capable is False:
+                    reasons.append("ZDR_MODELS_ONLY")
 
         return reasons
 

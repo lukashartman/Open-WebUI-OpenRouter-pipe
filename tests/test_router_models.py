@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from open_webui_openrouter_pipe.models.registry import OpenRouterModelRegistry
+from open_webui_openrouter_pipe.pipe import Pipe
 
 
 class _DummyResponse:
@@ -196,3 +197,93 @@ async def test_missing_pricing_is_not_free():
     from open_webui_openrouter_pipe.models.registry import is_free_model
 
     assert is_free_model("example.no-pricing") is False
+
+
+def _router_model_rows():
+    return [
+        {"id": "typesafe.jev-router", "norm_id": "typesafe.jev-router",
+         "name": "Jev Router", "original_id": "typesafe/jev-router"},
+        {"id": "openai.gpt-5", "norm_id": "openai.gpt-5",
+         "name": "GPT-5", "original_id": "openai/gpt-5"},
+    ]
+
+
+# gpt-5 is ZDR-capable, so it survives the filter and the router's treatment is isolated.
+_ZDR_LIST = [{"model_id": "openai/gpt-5"}]
+
+
+@pytest.mark.asyncio
+async def test_router_hidden_under_zdr_only_without_opt_in():
+    await _load_catalog(zdr=_ZDR_LIST)
+    pipe = Pipe()
+    pipe.valves.ZDR_MODELS_ONLY = True
+    pipe.valves.ZDR_ROUTER_MODELS = ""
+    kept = pipe._apply_model_filters(_router_model_rows(), pipe.valves)
+    assert [m["norm_id"] for m in kept] == ["openai.gpt-5"]
+
+
+@pytest.mark.asyncio
+async def test_listed_router_visible_under_zdr_only():
+    await _load_catalog(zdr=_ZDR_LIST)
+    pipe = Pipe()
+    pipe.valves.ZDR_MODELS_ONLY = True
+    pipe.valves.ZDR_ROUTER_MODELS = "typesafe/jev-router"
+    kept = pipe._apply_model_filters(_router_model_rows(), pipe.valves)
+    assert [m["norm_id"] for m in kept] == ["typesafe.jev-router", "openai.gpt-5"]
+
+
+@pytest.mark.asyncio
+async def test_listed_router_variant_resolves_to_base():
+    """Review Focus 1: a :variant of a listed router is admitted."""
+    await _load_catalog(zdr=_ZDR_LIST)
+    pipe = Pipe()
+    pipe.valves.ZDR_MODELS_ONLY = True
+    pipe.valves.ZDR_ROUTER_MODELS = "typesafe/jev-router"
+    rows = [
+        {"id": "typesafe.jev-router:exacto", "norm_id": "typesafe.jev-router:exacto",
+         "name": "Jev Router Exacto", "original_id": "typesafe/jev-router",
+         "variant_is_virtual": True, "variant_base_norm_id": "typesafe.jev-router"},
+    ]
+    kept = pipe._apply_model_filters(rows, pipe.valves)
+    assert [m["norm_id"] for m in kept] == ["typesafe.jev-router:exacto"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_valve_id_does_not_admit_router():
+    """Review Focus 5: a typo is inert."""
+    await _load_catalog(zdr=_ZDR_LIST)
+    pipe = Pipe()
+    pipe.valves.ZDR_MODELS_ONLY = True
+    pipe.valves.ZDR_ROUTER_MODELS = "typesafe/jev-routr"
+    kept = pipe._apply_model_filters(_router_model_rows(), pipe.valves)
+    assert [m["norm_id"] for m in kept] == ["openai.gpt-5"]
+
+
+@pytest.mark.asyncio
+async def test_restriction_reason_omitted_for_listed_router():
+    await _load_catalog()
+    pipe = Pipe()
+    pipe.valves.ZDR_MODELS_ONLY = True
+    pipe.valves.ZDR_ROUTER_MODELS = "typesafe/jev-router"
+    reasons = pipe._model_restriction_reasons(
+        "typesafe.jev-router",
+        valves=pipe.valves,
+        allowlist_norm_ids={"typesafe.jev-router"},
+        catalog_norm_ids={"typesafe.jev-router", "openai.gpt-5"},
+    )
+    assert "ZDR_MODELS_ONLY" not in reasons
+
+
+@pytest.mark.asyncio
+async def test_restriction_reason_present_for_unlisted_router():
+    await _load_catalog()
+    pipe = Pipe()
+    pipe.valves.ZDR_MODELS_ONLY = True
+    pipe.valves.ZDR_ROUTER_MODELS = ""
+    reasons = pipe._model_restriction_reasons(
+        "typesafe.jev-router",
+        valves=pipe.valves,
+        allowlist_norm_ids={"typesafe.jev-router"},
+        catalog_norm_ids={"typesafe.jev-router", "openai.gpt-5"},
+    )
+    assert "ZDR_MODELS_ONLY" in reasons
