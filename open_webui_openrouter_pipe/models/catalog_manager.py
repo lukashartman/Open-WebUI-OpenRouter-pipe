@@ -782,6 +782,14 @@ class ModelCatalogManager:
         overlay. Only the models named in the routing valves are fetched.
         """
         unique = sorted({(s or "").strip() for s in model_slugs if (s or "").strip()})
+        router_slugs = [s for s in unique if OpenRouterModelRegistry.is_router_model(s)]
+        if router_slugs:
+            self.logger.warning(
+                "Provider routing is skipped for router-class model(s): %s "
+                "(routers expose no provider endpoints).",
+                ", ".join(router_slugs),
+            )
+            unique = [s for s in unique if s not in router_slugs]
         if len(unique) > _PROVIDER_ROUTING_OVERLAY_MAX_MODELS:
             self.logger.warning(
                 "Provider routing valve lists %d models; only the first %d (sorted) get endpoint data.",

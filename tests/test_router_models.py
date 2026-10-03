@@ -425,3 +425,22 @@ async def test_task_reasoning_leaves_router_effort_unset():
 
     assert "effort" not in (body.reasoning or {})
     assert (body.reasoning or {}).get("enabled") is True
+
+
+from unittest.mock import AsyncMock, patch
+
+
+@pytest.mark.asyncio
+async def test_router_is_skipped_in_provider_overlay(pipe_instance_async):
+    """A router in a routing valve must not trigger an endpoints fetch."""
+    pipe = pipe_instance_async
+    OpenRouterModelRegistry._specs["typesafe.jev-router"] = {"is_router": True}
+    manager = pipe._ensure_catalog_manager()
+
+    with patch.object(manager, "_fetch_model_endpoints", new_callable=AsyncMock) as fetch:
+        overlay = await manager._build_routed_provider_overlay(
+            None, ["typesafe/jev-router"]
+        )
+
+    fetch.assert_not_awaited()
+    assert overlay == {}
