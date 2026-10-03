@@ -875,6 +875,12 @@ class ModelCatalogManager:
         merged = {slug: dict(entry) for slug, entry in frontend_map.items()}
         failed: list[str] = []
         for slug in sorted({(s or "").strip() for s in routed_slugs if (s or "").strip()}):
+            # Router-class models expose no provider endpoints; the overlay
+            # builder already logged the skip. Keep them out of the failed set
+            # so the misleading "check slug spelling" warning is never emitted
+            # for routers.
+            if OpenRouterModelRegistry.is_router_model(slug):
+                continue
             enriched = overlay.get(slug)
             if enriched is None:
                 fallback = merged.get(slug)
