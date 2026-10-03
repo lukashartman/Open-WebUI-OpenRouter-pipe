@@ -444,3 +444,103 @@ async def test_router_is_skipped_in_provider_overlay(pipe_instance_async):
 
     fetch.assert_not_awaited()
     assert overlay == {}
+
+
+from open_webui_openrouter_pipe.models.registry import router_downstream_model_id
+
+
+@pytest.mark.asyncio
+async def test_downstream_model_reported_for_router():
+    await _load_catalog()
+    assert (
+        router_downstream_model_id(
+            "typesafe/jev-router", {"model": "anthropic/claude-sonnet-4.6"}
+        )
+        == "anthropic/claude-sonnet-4.6"
+    )
+
+
+@pytest.mark.asyncio
+async def test_downstream_model_none_when_unchanged():
+    await _load_catalog()
+    assert router_downstream_model_id("typesafe/jev-router", {"model": "typesafe/jev-router"}) is None
+
+
+@pytest.mark.asyncio
+async def test_downstream_model_none_for_non_router():
+    await _load_catalog()
+    assert router_downstream_model_id("openai/gpt-5", {"model": "openai/gpt-5"}) is None
+
+
+@pytest.mark.asyncio
+async def test_downstream_model_none_for_missing_field():
+    await _load_catalog()
+    assert router_downstream_model_id("typesafe/jev-router", {}) is None
+    assert router_downstream_model_id("typesafe/jev-router", None) is None
+    assert router_downstream_model_id("typesafe/jev-router", {"model": "  "}) is None
+
+
+@pytest.mark.asyncio
+async def test_router_route_status_emitted_once():
+    """The streaming loop emits exactly one best-effort status line."""
+    pipe = Pipe()
+    try:
+        pipe.valves.API_KEY = EncryptedStr("test-api-key")
+        pipe.valves.BASE_URL = "https://openrouter.ai/api/v1"
+
+        sse = (
+            'data: {"type":"response.output_text.delta","delta":"hi"}\n\n'
+            'data: {"type":"response.completed","response":'
+            '{"model":"anthropic/claude-sonnet-4.6","output":[],'
+            '"usage":{"input_tokens":5,"output_tokens":3}}}\n\n'
+        )
+
+        def callback(url, **kwargs):
+            return CallbackResult(
+                body=sse.encode("utf-8"),
+                headers={"Content-Type": "text/event-stream"},
+                status=200,
+            )
+
+        events: list[dict] = []
+
+        async def event_emitter(event):
+            events.append(event)
+
+        with aioresponses() as mock_http:
+            mock_http.post("https://openrouter.ai/api/v1/responses", callback=callback, repeat=True)
+            mock_http.get(
+                "https://openrouter.ai/api/v1/models", payload={"data": [ROUTER_MODEL]}, repeat=True
+            )
+            mock_http.get(
+                "https://openrouter.ai/api/v1/endpoints/zdr", payload={"data": []}, repeat=True
+            )
+            result = await pipe.pipe(
+                body={"model": "typesafe/jev-router",
+                      "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                __user__={"id": "user_123"},
+                __request__=None,
+                __event_emitter__=event_emitter,
+                __event_call__=None,
+                __metadata__={"model": {"id": "typesafe/jev-router"}},
+                __tools__=None,
+                __task__=None,
+                __task_body__=None,
+            )
+            # Streaming requests are delivered through the middleware stream
+            # channel (chunks of {"event": {...}}), not the raw emitter.
+            if hasattr(result, "__aiter__"):
+                async for _chunk in result:
+                    if isinstance(_chunk, dict) and isinstance(_chunk.get("event"), dict):
+                        events.append(_chunk["event"])
+
+        routed = [
+            e for e in events
+            if isinstance(e, dict)
+            and e.get("type") == "status"
+            and "Routed via" in str((e.get("data") or {}).get("description", ""))
+        ]
+        assert len(routed) == 1, f"expected exactly one route status, got {routed}"
+        assert "anthropic/claude-sonnet-4.6" in routed[0]["data"]["description"]
+    finally:
+        await pipe.close()

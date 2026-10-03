@@ -1276,6 +1276,27 @@ def is_free_model(model_norm_id: str) -> bool:
     return total == Decimal(0)
 
 
+def router_downstream_model_id(requested_model: Any, upstream_payload: Any) -> Optional[str]:
+    """Return the model OpenRouter reported serving a router request, if different.
+
+    Best-effort observability only: returns None when the requested model is not
+    a router, when the payload carries no usable ``model`` field, or when the
+    reported model is the requested one.
+    """
+    if not isinstance(upstream_payload, dict):
+        return None
+    requested = str(requested_model or "")
+    if not OpenRouterModelRegistry.is_router_model(requested):
+        return None
+    reported = upstream_payload.get("model")
+    if not isinstance(reported, str) or not reported.strip():
+        return None
+    reported = reported.strip()
+    if ModelFamily.base_model(reported) == ModelFamily.base_model(requested):
+        return None
+    return reported
+
+
 def supports_tool_calling(model_norm_id: str) -> bool:
     """Check if model supports tool calling by checking supported parameters.
 
