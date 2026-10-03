@@ -541,7 +541,7 @@ class OpenRouterModelRegistry:
         coerce = OpenRouterModelRegistry._coerce_pricing_number
         prompt = coerce(pricing.get("prompt"))
         completion = coerce(pricing.get("completion"))
-        if prompt is not None and prompt < Decimal(0):
+        if prompt is not None and prompt.is_finite() and prompt < Decimal(0):
             return True
         tokenizer = architecture.get("tokenizer")
         if not isinstance(tokenizer, str) or tokenizer.strip().lower() != "router":
@@ -1265,6 +1265,11 @@ def is_free_model(model_norm_id: str) -> bool:
     coerce = OpenRouterModelRegistry._coerce_pricing_number
     prompt = coerce(pricing.get("prompt"))
     completion = coerce(pricing.get("completion"))
+    if (prompt is not None and not prompt.is_finite()) or (
+        completion is not None and not completion.is_finite()
+    ):
+        # Non-finite pricing (e.g. "nan"/"Infinity") is malformed: never free.
+        return False
     if (prompt is not None and prompt < Decimal(0)) or (
         completion is not None and completion < Decimal(0)
     ):

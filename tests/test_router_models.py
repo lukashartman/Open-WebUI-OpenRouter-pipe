@@ -111,11 +111,19 @@ NO_PRICING_MODEL = {
     "supported_parameters": ["reasoning"],
 }
 
+NAN_PRICED_MODEL = {
+    "id": "example/nan-price",
+    "name": "NaN Price",
+    "pricing": {"prompt": "nan", "completion": "0.5"},
+    "architecture": {"tokenizer": "GPT", "output_modalities": ["text"]},
+    "supported_parameters": ["reasoning"],
+}
+
 
 async def _load_catalog(session=None, zdr=None) -> None:
     session = session or _CatalogSession(
         [ROUTER_MODEL, ZERO_PRICED_ROUTER, TILDE_ALIAS, CONCRETE_MODEL,
-         FREE_CONCRETE_MODEL, NO_PRICING_MODEL],
+         FREE_CONCRETE_MODEL, NO_PRICING_MODEL, NAN_PRICED_MODEL],
         zdr=zdr,
     )
     await OpenRouterModelRegistry.ensure_loaded(
@@ -200,6 +208,22 @@ async def test_missing_pricing_is_not_free():
     from open_webui_openrouter_pipe.models.registry import is_free_model
 
     assert is_free_model("example.no-pricing") is False
+
+
+@pytest.mark.asyncio
+async def test_non_finite_pricing_is_not_router():
+    """Review hardening: a NaN price must not raise and is not a router."""
+    await _load_catalog()
+    assert OpenRouterModelRegistry.is_router_model("example/nan-price") is False
+
+
+@pytest.mark.asyncio
+async def test_non_finite_pricing_is_not_free():
+    """Review hardening: a NaN price must not raise and is not free."""
+    await _load_catalog()
+    from open_webui_openrouter_pipe.models.registry import is_free_model
+
+    assert is_free_model("example.nan-price") is False
 
 
 def _router_model_rows():

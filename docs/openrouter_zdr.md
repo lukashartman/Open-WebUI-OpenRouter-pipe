@@ -67,6 +67,8 @@ data path OpenRouter does not guarantee is ZDR.
 
 See: [Router-Class Models](model_routers.md).
 
+---
+
 ## Relationship to provider routing filters
 
 Provider routing filters also expose a `ZDR` toggle that maps to `provider.zdr`. If you enable **both** the provider routing filter and pipe‑level ZDR enforcement, the pipe will force `provider.zdr=true` regardless of filter settings.
