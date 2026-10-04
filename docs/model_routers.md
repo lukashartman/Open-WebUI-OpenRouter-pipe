@@ -20,6 +20,36 @@ The complete set at the time of writing is `typesafe/jev-router`, `nvidia/switch
 `openrouter/auto`, `openrouter/auto-beta`, `openrouter/free`, `openrouter/fusion`,
 `openrouter/pareto-code`, and `openrouter/bodybuilder`.
 
+## Customizing the router's selection
+
+Two admin valves constrain what a hosted router is allowed to pick:
+
+- `Router allowed models` (`ROUTER_ALLOWED_MODELS`) — only models matching one of these
+  patterns are candidates. Empty means the router's full pool.
+- `Router excluded models` (`ROUTER_EXCLUDED_MODELS`) — matching models are never picked.
+
+Both take comma-separated patterns, matched case-sensitively upstream: an exact slug
+(`openai/gpt-5.1`), a wildcard (`anthropic/*`, `openai/gpt-5*`, `*flash*`), or a
+`~author/family-latest` alias. Up to 1024 entries per list.
+
+The pipe attaches them as a `plugins` entry on the request, under the plugin id the router
+expects:
+
+```json
+{"plugins": [{"id": "jev-router", "allowed_models": ["anthropic/*"], "excluded_models": ["openai/gpt-4o"]}]}
+```
+
+The ids are `jev-router` for `typesafe/jev-router`, `auto-router` for `openrouter/auto`,
+and `auto-beta-router` for `openrouter/auto-beta`; every other model is sent untouched.
+With both valves empty, no entry is sent.
+
+The lists only narrow the router's candidate pool — they never add models and do not change
+how the router ranks what remains. Two upstream behaviours matter when writing them:
+an allow list that matches nothing at all is ignored (the router falls back to its full
+pool, still honouring exclusions), while exclusions are never ignored — if they remove
+every candidate the request fails with OpenRouter `404`. These valves govern the router's
+internal choice only; they do not change catalog visibility or ZDR handling.
+
 ## Zero Data Retention
 
 Routers expose **no provider endpoints**, so they never appear in OpenRouter's

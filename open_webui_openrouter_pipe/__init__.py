@@ -80,6 +80,7 @@ if TYPE_CHECKING:
         CompletionsBody,
         _apply_disable_native_websearch_to_payload,
         _apply_identifier_valves_to_payload,
+        _apply_router_model_lists_to_payload,
         _responses_payload_to_chat_completions_payload,
         _filter_openrouter_request,
         _strip_disable_model_settings_params,
@@ -157,6 +158,7 @@ __all__ = [
     "CompletionsBody",
     "_apply_disable_native_websearch_to_payload",
     "_apply_identifier_valves_to_payload",
+    "_apply_router_model_lists_to_payload",
     "_responses_payload_to_chat_completions_payload",
 
     # Error handling

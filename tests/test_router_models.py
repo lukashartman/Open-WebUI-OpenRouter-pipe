@@ -328,13 +328,15 @@ async def _consume(result) -> None:
             pass
 
 
-async def _run_zdr_request(valve_router_ids: str):
+async def _run_zdr_request(valve_router_ids: str, extra_valves: dict[str, Any] | None = None):
     pipe = Pipe()
     try:
         pipe.valves.API_KEY = EncryptedStr("test-api-key")
         pipe.valves.BASE_URL = "https://openrouter.ai/api/v1"
         pipe.valves.ZDR_ENFORCE = True
         pipe.valves.ZDR_ROUTER_MODELS = valve_router_ids
+        for key, value in (extra_valves or {}).items():
+            setattr(pipe.valves, key, value)
 
         captured: list[dict] = []
 
@@ -568,3 +570,198 @@ async def test_router_route_status_emitted_once():
         assert "anthropic/claude-sonnet-4.6" in routed[0]["data"]["description"]
     finally:
         await pipe.close()
+
+
+# ---------------------------------------------------------------------------
+# Router model selection lists (ROUTER_ALLOWED_MODELS / ROUTER_EXCLUDED_MODELS)
+# ---------------------------------------------------------------------------
+
+from open_webui_openrouter_pipe.api.transforms import _apply_router_model_lists_to_payload
+from open_webui_openrouter_pipe.models.registry import (
+    parse_router_model_list_valve,
+    router_plugin_id_for_model,
+)
+
+
+def test_parse_router_model_list_valve_empty():
+    assert parse_router_model_list_valve("") == []
+    assert parse_router_model_list_valve(None) == []
+    assert parse_router_model_list_valve("  ,  ,") == []
+
+
+def test_parse_router_model_list_valve_preserves_patterns():
+    """Wildcards and ~latest aliases must survive verbatim, in order."""
+    parsed = parse_router_model_list_valve(
+        "anthropic/*, openai/gpt-5.1 ,*flash*, ~anthropic/claude-opus-latest"
+    )
+    assert parsed == [
+        "anthropic/*",
+        "openai/gpt-5.1",
+        "*flash*",
+        "~anthropic/claude-opus-latest",
+    ]
+
+
+def test_parse_router_model_list_valve_dedupes_and_drops_blanks():
+    assert parse_router_model_list_valve("anthropic/*,,anthropic/*,  ") == ["anthropic/*"]
+
+
+def test_parse_router_model_list_valve_accepts_list():
+    assert parse_router_model_list_valve(["openai/gpt-5", " openai/gpt-5 "]) == ["openai/gpt-5"]
+
+
+def test_parse_router_model_list_valve_caps_entries():
+    raw = ",".join(f"author/model-{i}" for i in range(1100))
+    assert len(parse_router_model_list_valve(raw)) == 1024
+
+
+def test_parse_router_model_list_valve_warns_on_inner_whitespace(caplog):
+    with caplog.at_level(logging.WARNING):
+        parsed = parse_router_model_list_valve("openai /gpt-5")
+    assert parsed == ["openai /gpt-5"]
+    assert any("whitespace" in record.message for record in caplog.records)
+
+
+def test_router_plugin_id_for_model():
+    assert router_plugin_id_for_model("typesafe/jev-router") == "jev-router"
+    assert router_plugin_id_for_model("typesafe/jev-router:nitro") == "jev-router"
+    assert router_plugin_id_for_model("openrouter/auto") == "auto-router"
+    assert router_plugin_id_for_model("openrouter/auto-beta") == "auto-beta-router"
+    assert router_plugin_id_for_model("openai/gpt-5") is None
+    assert router_plugin_id_for_model("") is None
+
+
+def _body(model: str, plugins=None) -> ResponsesBody:
+    return ResponsesBody(model=model, input=[], plugins=plugins)
+
+
+def test_apply_router_lists_jev_router_entry():
+    pipe = Pipe()
+    pipe.valves.ROUTER_ALLOWED_MODELS = "anthropic/*"
+    pipe.valves.ROUTER_EXCLUDED_MODELS = "openai/gpt-4o"
+
+    body = _body("typesafe/jev-router")
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+
+    assert body.plugins == [
+        {
+            "id": "jev-router",
+            "allowed_models": ["anthropic/*"],
+            "excluded_models": ["openai/gpt-4o"],
+        }
+    ]
+
+
+def test_apply_router_lists_auto_router_plugin_ids():
+    pipe = Pipe()
+    pipe.valves.ROUTER_ALLOWED_MODELS = "google/*"
+
+    for model, plugin_id in (
+        ("openrouter/auto", "auto-router"),
+        ("openrouter/auto-beta", "auto-beta-router"),
+    ):
+        body = _body(model)
+        _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+        assert body.plugins == [{"id": plugin_id, "allowed_models": ["google/*"]}]
+
+
+def test_apply_router_lists_skips_non_router():
+    pipe = Pipe()
+    pipe.valves.ROUTER_ALLOWED_MODELS = "anthropic/*"
+
+    body = _body("openai/gpt-5")
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+    assert body.plugins is None
+
+
+def test_apply_router_lists_noop_when_empty():
+    pipe = Pipe()
+    body = _body("typesafe/jev-router")
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+    assert body.plugins is None
+
+
+def test_apply_router_lists_excluded_only_omits_allowed_key():
+    pipe = Pipe()
+    pipe.valves.ROUTER_EXCLUDED_MODELS = "openai/*"
+
+    body = _body("typesafe/jev-router")
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+    assert body.plugins == [{"id": "jev-router", "excluded_models": ["openai/*"]}]
+
+
+def test_apply_router_lists_preserves_other_plugins():
+    pipe = Pipe()
+    pipe.valves.ROUTER_ALLOWED_MODELS = "anthropic/*"
+
+    body = _body("typesafe/jev-router", plugins=[{"id": "web"}])
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+    assert body.plugins == [
+        {"id": "web"},
+        {"id": "jev-router", "allowed_models": ["anthropic/*"]},
+    ]
+
+
+def test_apply_router_lists_upserts_existing_entry():
+    pipe = Pipe()
+    pipe.valves.ROUTER_ALLOWED_MODELS = "anthropic/*"
+
+    body = _body("typesafe/jev-router", plugins=[{"id": "jev-router", "keep": True}])
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+    assert body.plugins == [
+        {"id": "jev-router", "keep": True, "allowed_models": ["anthropic/*"]}
+    ]
+
+
+def test_router_plugin_entry_survives_request_filter():
+    """The injected entry must not be stripped by the payload field filter."""
+    from open_webui_openrouter_pipe.api.transforms import _filter_openrouter_request
+
+    pipe = Pipe()
+    pipe.valves.ROUTER_ALLOWED_MODELS = "anthropic/*"
+    body = _body("typesafe/jev-router")
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+
+    payload = _filter_openrouter_request(body.model_dump(exclude_none=True))
+    assert {"id": "jev-router", "allowed_models": ["anthropic/*"]} in payload["plugins"]
+
+
+def test_router_plugin_entry_survives_chat_completions_conversion():
+    """Fallback /chat/completions conversion keeps non-fusion plugin entries."""
+    from open_webui_openrouter_pipe.api.transforms import (
+        _responses_payload_to_chat_completions_payload,
+    )
+
+    pipe = Pipe()
+    pipe.valves.ROUTER_EXCLUDED_MODELS = "openai/*"
+    body = _body("typesafe/jev-router")
+    _apply_router_model_lists_to_payload(body, valves=pipe.valves)
+
+    chat = _responses_payload_to_chat_completions_payload(body.model_dump(exclude_none=True))
+    assert {"id": "jev-router", "excluded_models": ["openai/*"]} in chat["plugins"]
+
+
+@pytest.mark.asyncio
+async def test_router_lists_reach_upstream_payload():
+    captured = await _run_zdr_request(
+        "typesafe/jev-router",
+        extra_valves={
+            "ROUTER_ALLOWED_MODELS": "anthropic/*",
+            "ROUTER_EXCLUDED_MODELS": "openai/gpt-4o",
+        },
+    )
+    assert captured, "Expected the router request to be sent"
+    plugins = captured[-1].get("plugins") or []
+    assert {
+        "id": "jev-router",
+        "allowed_models": ["anthropic/*"],
+        "excluded_models": ["openai/gpt-4o"],
+    } in plugins
+
+
+@pytest.mark.asyncio
+async def test_router_lists_absent_by_default_upstream():
+    captured = await _run_zdr_request("typesafe/jev-router")
+    assert captured, "Expected the router request to be sent"
+    plugins = captured[-1].get("plugins") or []
+    assert all(entry.get("id") != "jev-router" for entry in plugins if isinstance(entry, dict))

@@ -35,6 +35,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  # aioresponses 0.7.9 cannot construct aiohttp 3.14 responses
+  # (ClientResponse gained a required stream_writer kwarg), so every
+  # HTTP-mocking test fails or hangs. Cap aiohttp until aioresponses
+  # supports 3.14.
+  "aiohttp>=3.9,<3.14",
   "aioresponses"
 ]
 

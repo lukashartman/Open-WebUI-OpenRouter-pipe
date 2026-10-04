@@ -27,7 +27,13 @@ from .fusion_engine import FusionInnerInvocation, latest_user_text, run_internal
 from ..core.utils import _select_best_effort_fallback
 from ..tools.tool_registry import _build_collision_safe_tool_specs_and_registry
 from ..models.registry import ModelFamily, OpenRouterModelRegistry, router_is_zdr_opted_in
-from ..api.transforms import CompletionsBody, ResponsesBody, _chat_tools_to_responses_tools, apply_context_transforms
+from ..api.transforms import (
+    CompletionsBody,
+    ResponsesBody,
+    _apply_router_model_lists_to_payload,
+    _chat_tools_to_responses_tools,
+    apply_context_transforms,
+)
 from ..core.timing_logger import timed
 from ..core.logging_system import SessionLogger
 from .task_model_adapter import TaskModelAdapter
@@ -740,6 +746,8 @@ class RequestOrchestrator:
                 responses_body.provider = {**existing_provider, "zdr": True}
             else:
                 responses_body.provider = {"zdr": True}
+
+        _apply_router_model_lists_to_payload(responses_body, valves=valves)
 
         is_direct = bool(getattr(getattr(__request__, "state", None), "direct", False))
         fusion_model = is_fusion_model(responses_body.model)
