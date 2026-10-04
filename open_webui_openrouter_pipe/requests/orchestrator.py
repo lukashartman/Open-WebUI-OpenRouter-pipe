@@ -26,7 +26,7 @@ from ..integrations.image_help import render_image_help
 from .fusion_engine import FusionInnerInvocation, latest_user_text, run_internal_fusion
 from ..core.utils import _select_best_effort_fallback
 from ..tools.tool_registry import _build_collision_safe_tool_specs_and_registry
-from ..models.registry import ModelFamily, OpenRouterModelRegistry
+from ..models.registry import ModelFamily, OpenRouterModelRegistry, router_is_zdr_opted_in
 from ..api.transforms import CompletionsBody, ResponsesBody, _chat_tools_to_responses_tools, apply_context_transforms
 from ..core.timing_logger import timed
 from ..core.logging_system import SessionLogger
@@ -679,54 +679,61 @@ class RequestOrchestrator:
                 user_requests_zdr = False
         enforce_zdr = admin_enforce_zdr or user_requests_zdr
         if enforce_zdr:
-            zdr_lookup_id = (
-                normalized_model_id.rsplit(":", 1)[0]
-                if ":" in normalized_model_id
-                else normalized_model_id
+            # A router listed in ZDR_ROUTER_MODELS is an explicit operator opt-in;
+            # routers are never in the ZDR endpoint list, so the list's presence is
+            # irrelevant to the decision and the request proceeds.
+            router_opted_in = router_is_zdr_opted_in(
+                normalized_model_id, valves.ZDR_ROUTER_MODELS
             )
-            zdr_capable = OpenRouterModelRegistry.is_zdr_capable(zdr_lookup_id)
-            if zdr_capable is False:
-                if use_task_model_adapter:
-                    return self._pipe._build_task_fallback_content(task_name)
-                await self._pipe._ensure_error_formatter()._emit_templated_error(
-                    __event_emitter__,
-                    template=valves.MODEL_RESTRICTED_TEMPLATE,
-                    variables={
-                        "requested_model": responses_body.model,
-                        "normalized_model_id": normalized_model_id,
-                        "restriction_reasons": "ZDR_ENFORCE",
-                        "model_id_filter": "",
-                        "free_model_filter": "",
-                        "tool_calling_filter": "",
-                    },
-                    log_message=(
-                        f"Model restricted due to ZDR enforcement (requested={responses_body.model}, "
-                        f"normalized={normalized_model_id})"
-                    ),
-                    log_level=logging.WARNING,
+            if not router_opted_in:
+                zdr_lookup_id = (
+                    normalized_model_id.rsplit(":", 1)[0]
+                    if ":" in normalized_model_id
+                    else normalized_model_id
                 )
-                return ""
-            if zdr_capable is None:
-                if use_task_model_adapter:
-                    return self._pipe._build_task_fallback_content(task_name)
-                await self._pipe._ensure_error_formatter()._emit_templated_error(
-                    __event_emitter__,
-                    template=valves.MODEL_RESTRICTED_TEMPLATE,
-                    variables={
-                        "requested_model": responses_body.model,
-                        "normalized_model_id": normalized_model_id,
-                        "restriction_reasons": "ZDR_ENFORCE_UNAVAILABLE",
-                        "model_id_filter": "",
-                        "free_model_filter": "",
-                        "tool_calling_filter": "",
-                    },
-                    log_message=(
-                        f"Model rejected — ZDR enforcement requested but ZDR endpoint list is unavailable "
-                        f"(requested={responses_body.model}, normalized={normalized_model_id})"
-                    ),
-                    log_level=logging.ERROR,
-                )
-                return ""
+                zdr_capable = OpenRouterModelRegistry.is_zdr_capable(zdr_lookup_id)
+                if zdr_capable is False:
+                    if use_task_model_adapter:
+                        return self._pipe._build_task_fallback_content(task_name)
+                    await self._pipe._ensure_error_formatter()._emit_templated_error(
+                        __event_emitter__,
+                        template=valves.MODEL_RESTRICTED_TEMPLATE,
+                        variables={
+                            "requested_model": responses_body.model,
+                            "normalized_model_id": normalized_model_id,
+                            "restriction_reasons": "ZDR_ENFORCE",
+                            "model_id_filter": "",
+                            "free_model_filter": "",
+                            "tool_calling_filter": "",
+                        },
+                        log_message=(
+                            f"Model restricted due to ZDR enforcement (requested={responses_body.model}, "
+                            f"normalized={normalized_model_id})"
+                        ),
+                        log_level=logging.WARNING,
+                    )
+                    return ""
+                if zdr_capable is None:
+                    if use_task_model_adapter:
+                        return self._pipe._build_task_fallback_content(task_name)
+                    await self._pipe._ensure_error_formatter()._emit_templated_error(
+                        __event_emitter__,
+                        template=valves.MODEL_RESTRICTED_TEMPLATE,
+                        variables={
+                            "requested_model": responses_body.model,
+                            "normalized_model_id": normalized_model_id,
+                            "restriction_reasons": "ZDR_ENFORCE_UNAVAILABLE",
+                            "model_id_filter": "",
+                            "free_model_filter": "",
+                            "tool_calling_filter": "",
+                        },
+                        log_message=(
+                            f"Model rejected — ZDR enforcement requested but ZDR endpoint list is unavailable "
+                            f"(requested={responses_body.model}, normalized={normalized_model_id})"
+                        ),
+                        log_level=logging.ERROR,
+                    )
+                    return ""
 
             existing_provider = responses_body.provider or {}
             if isinstance(existing_provider, dict):

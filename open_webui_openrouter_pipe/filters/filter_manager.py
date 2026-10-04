@@ -2384,6 +2384,27 @@ class Filter:
             else:
                 model_visibility[slug] = "user"
 
+        # Router-class models expose no provider endpoints; never generate a
+        # provider-routing filter for them.
+        from ..models.registry import OpenRouterModelRegistry
+
+        router_slugs = {slug for slug in all_models if OpenRouterModelRegistry.is_router_model(slug)}
+        if router_slugs:
+            self.logger.warning(
+                "Provider routing is skipped for router-class model(s): %s "
+                "(routers expose no provider endpoints).",
+                ", ".join(sorted(router_slugs)),
+            )
+            all_models -= router_slugs
+            # The creation loop below iterates model_visibility, not all_models;
+            # drop routers there too so they never reach the "no providers found"
+            # warning or get an (empty) filter created.
+            model_visibility = {
+                slug: visibility
+                for slug, visibility in model_visibility.items()
+                if slug not in router_slugs
+            }
+
         # Find existing provider routing filters
         try:
             all_filters = await Functions.get_functions_by_type("filter", active_only=False)

@@ -782,6 +782,14 @@ class ModelCatalogManager:
         overlay. Only the models named in the routing valves are fetched.
         """
         unique = sorted({(s or "").strip() for s in model_slugs if (s or "").strip()})
+        router_slugs = [s for s in unique if OpenRouterModelRegistry.is_router_model(s)]
+        if router_slugs:
+            self.logger.warning(
+                "Provider routing is skipped for router-class model(s): %s "
+                "(routers expose no provider endpoints).",
+                ", ".join(router_slugs),
+            )
+            unique = [s for s in unique if s not in router_slugs]
         if len(unique) > _PROVIDER_ROUTING_OVERLAY_MAX_MODELS:
             self.logger.warning(
                 "Provider routing valve lists %d models; only the first %d (sorted) get endpoint data.",
@@ -867,6 +875,12 @@ class ModelCatalogManager:
         merged = {slug: dict(entry) for slug, entry in frontend_map.items()}
         failed: list[str] = []
         for slug in sorted({(s or "").strip() for s in routed_slugs if (s or "").strip()}):
+            # Router-class models expose no provider endpoints; the overlay
+            # builder already logged the skip. Keep them out of the failed set
+            # so the misleading "check slug spelling" warning is never emitted
+            # for routers.
+            if OpenRouterModelRegistry.is_router_model(slug):
+                continue
             enriched = overlay.get(slug)
             if enriched is None:
                 fallback = merged.get(slug)

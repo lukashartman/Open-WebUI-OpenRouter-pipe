@@ -77,6 +77,7 @@ from ..models.registry import (
     _parse_model_patterns,
     _matches_any_model_pattern,
     ModelFamily,
+    router_downstream_model_id,
 )
 
 # Import transform functions
@@ -527,6 +528,7 @@ class StreamingHandler:
         message_id = metadata.get("message_id")
         model_started = asyncio.Event()
         responding_status_sent = False
+        router_route_state = {"reported": False}
         provider_status_seen = False
         generation_started_at: float | None = None
         generation_last_event_at: float | None = None
@@ -2222,6 +2224,17 @@ class StreamingHandler:
                         usage=total_usage,
                         done=False,
                     )
+
+                if not router_route_state["reported"]:
+                    downstream_id = router_downstream_model_id(body.model, final_response)
+                    if downstream_id:
+                        router_route_state["reported"] = True
+                        self.logger.debug(
+                            "Router %s served this turn via %s", body.model, downstream_id
+                        )
+                        await self._pipe._event_emitter_handler._emit_status(
+                            event_emitter, f"Routed via `{downstream_id}`"
+                        )
 
                 metadata_model = None
                 if isinstance(metadata, dict):
