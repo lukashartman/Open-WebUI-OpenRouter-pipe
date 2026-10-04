@@ -54,6 +54,21 @@ OpenRouter's ZDR enforcement applies to provider routing for inference only. Plu
 
 ---
 
+## Router-class models
+
+Router-class models (`typesafe/jev-router`, `openrouter/auto`, …) expose no provider
+endpoints, so they are never in OpenRouter's ZDR list and both ZDR controls treat them as
+non-ZDR: `ZDR_MODELS_ONLY` hides them and `ZDR_ENFORCE` rejects them.
+
+`ZDR_ROUTER_MODELS` is the explicit opt-in. List a router slug (comma-separated) to admit
+it: it becomes selectable and, under enforcement, the request carries `provider.zdr=true`.
+Only the routing step is covered — the downstream model the router selects is a separate
+data path OpenRouter does not guarantee is ZDR.
+
+See: [Router-Class Models](model_routers.md).
+
+---
+
 ## Relationship to provider routing filters
 
 Provider routing filters also expose a `ZDR` toggle that maps to `provider.zdr`. If you enable **both** the provider routing filter and pipe‑level ZDR enforcement, the pipe will force `provider.zdr=true` regardless of filter settings.

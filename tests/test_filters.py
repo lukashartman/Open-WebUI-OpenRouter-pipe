@@ -2140,6 +2140,25 @@ class TestProviderRoutingEndToEndOverlay:
         assert "Gamma" in stored.content
         assert stored.is_active is True
 
+    @pytest.mark.asyncio
+    async def test_router_model_gets_no_provider_filter(self, pipe_instance_async, monkeypatch):
+        from open_webui import models as owui_models
+
+        _FakeFunctionsTable.reset()
+        monkeypatch.setattr(owui_models.functions, "Functions", _FakeFunctionsTable)
+
+        pipe = pipe_instance_async
+        from open_webui_openrouter_pipe.models.registry import OpenRouterModelRegistry
+
+        OpenRouterModelRegistry._specs["typesafe.jev-router"] = {"is_router": True}
+
+        filter_manager = pipe._ensure_filter_manager()
+        mapping = await filter_manager.ensure_provider_routing_filters(
+            "typesafe/jev-router", "", {}, [], "openrouter",
+        )
+        assert mapping == {}
+        assert _FakeFunctionsTable.store == {}
+
     def test_hash_differs_between_collapsed_and_enriched_map(self):
         collapsed = {
             "example/null-model": {

@@ -3989,6 +3989,45 @@ class TestProviderOverlayMerge:
         assert manager.logger.warning.call_count > first_warnings
 
     @pytest.mark.asyncio
+    async def test_router_in_valve_produces_no_endpoints_warning(
+        self, pipe_instance_async, monkeypatch
+    ) -> None:
+        from open_webui_openrouter_pipe.models.registry import OpenRouterModelRegistry
+
+        monkeypatch.setitem(
+            OpenRouterModelRegistry._specs, "typesafe.jev-router", {"is_router": True}
+        )
+        manager = pipe_instance_async._ensure_catalog_manager()
+        manager._cached_provider_map = {}
+        manager.logger = Mock()
+
+        provider_map = await manager._build_provider_map_with_overlay(
+            None, None, "typesafe/jev-router", ""
+        )
+
+        assert "typesafe/jev-router" not in provider_map
+        assert "typesafe/jev-router" not in manager._provider_overlay_failed_slugs
+        warning_text = " ".join(
+            str(call.args[0]) for call in manager.logger.warning.call_args_list
+        )
+        assert "check slug spelling" not in warning_text
+        assert "endpoints data unavailable" not in warning_text
+
+    def test_non_router_unavailable_endpoints_still_warns(self, pipe_instance) -> None:
+        manager = self._manager(pipe_instance)
+        manager._cached_provider_map = {}
+        manager.logger = Mock()
+        manager._provider_overlay_failed_slugs = frozenset()
+
+        manager._merge_provider_overlay({}, {}, ["ghost/model"])
+
+        warning_text = " ".join(
+            str(call.args[0]) for call in manager.logger.warning.call_args_list
+        )
+        assert "check slug spelling" in warning_text
+        assert "ghost/model" in manager._provider_overlay_failed_slugs
+
+    @pytest.mark.asyncio
     async def test_overlay_survives_frontend_outage(self, pipe_instance_async) -> None:
         pipe = pipe_instance_async
         manager = pipe._ensure_catalog_manager()

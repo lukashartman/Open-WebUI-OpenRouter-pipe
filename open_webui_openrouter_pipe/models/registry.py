@@ -345,6 +345,7 @@ class OpenRouterModelRegistry:
                 architecture,
                 pricing,
             )
+            is_router = cls._detect_router(architecture, pricing)
 
             max_completion_tokens: Optional[int] = None
             top_provider = full_model.get("top_provider")
@@ -356,6 +357,7 @@ class OpenRouterModelRegistry:
                 # Derived features for fast capability checks
                 "features": features,
                 "capabilities": capabilities,
+                "is_router": is_router,
                 "max_completion_tokens": max_completion_tokens,
                 "supported_parameters": frozenset(supported_parameters),
 
@@ -526,6 +528,25 @@ class OpenRouterModelRegistry:
             numeric = [c for c in candidates if c is not None]
             return max(numeric) if numeric else None
         return None
+
+    @staticmethod
+    def _detect_router(architecture: Dict[str, Any], pricing: Dict[str, Any]) -> bool:
+        """Return True when a catalog entry is a router-class model.
+
+        Router-class means the entry's own price is a selection-step sentinel
+        (negative), or it is a zero-priced entry whose tokenizer is the router
+        tokenizer. ``~provider/model-latest`` aliases carry real non-zero
+        pricing, so they are deliberately excluded.
+        """
+        coerce = OpenRouterModelRegistry._coerce_pricing_number
+        prompt = coerce(pricing.get("prompt"))
+        completion = coerce(pricing.get("completion"))
+        if prompt is not None and prompt.is_finite() and prompt < Decimal(0):
+            return True
+        tokenizer = architecture.get("tokenizer")
+        if not isinstance(tokenizer, str) or tokenizer.strip().lower() != "router":
+            return False
+        return prompt == Decimal(0) and completion == Decimal(0)
 
     @staticmethod
     def _supports_web_search(pricing: Dict[str, Any]) -> bool:
@@ -958,6 +979,20 @@ class OpenRouterModelRegistry:
         return norm in cls._zdr_model_ids
 
     @classmethod
+    def is_router_model(cls, model_id: str) -> bool:
+        """Return True when ``model_id`` resolves to a router-class catalog entry.
+
+        Variant suffixes (``:nitro`` and friends) resolve to their base entry.
+        Unknown ids and models without catalog metadata return False.
+        """
+        norm = ModelFamily.base_model(model_id)
+        if not norm:
+            return False
+        base_norm = norm.rsplit(":", 1)[0] if ":" in norm else norm
+        spec = cls._specs.get(base_norm) or {}
+        return bool(spec.get("is_router"))
+
+    @classmethod
     @timed
     async def _fetch_zdr_model_ids(
         cls,
@@ -1093,6 +1128,40 @@ def _parse_model_patterns(value: Any) -> list[str]:
 
 
 # -----------------------------------------------------------------------------
+# ZDR Router Opt-In Helpers
+# -----------------------------------------------------------------------------
+
+
+def _zdr_router_base_norm(model_id: Any) -> str:
+    """Return the sanitized, variant-stripped base norm id for a router id."""
+    norm = ModelFamily.base_model(sanitize_model_id(str(model_id or "")))
+    return norm.rsplit(":", 1)[0] if ":" in norm else norm
+
+
+def parse_zdr_router_valve(value: Any) -> set[str]:
+    """Normalize the ZDR_ROUTER_MODELS CSV into a set of base norm ids."""
+    if not value:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        entries = [str(entry) for entry in value]
+    else:
+        entries = str(value).split(",")
+    parsed: set[str] = set()
+    for entry in entries:
+        base = _zdr_router_base_norm(entry.strip())
+        if base:
+            parsed.add(base)
+    return parsed
+
+
+def router_is_zdr_opted_in(model_id: Any, valve_value: Any) -> bool:
+    """True when ``model_id`` is a router explicitly listed in ZDR_ROUTER_MODELS."""
+    if not OpenRouterModelRegistry.is_router_model(str(model_id or "")):
+        return False
+    return _zdr_router_base_norm(model_id) in parse_zdr_router_valve(valve_value)
+
+
+# -----------------------------------------------------------------------------
 # Pricing Helpers
 # -----------------------------------------------------------------------------
 
@@ -1193,10 +1262,44 @@ def is_free_model(model_norm_id: str) -> bool:
         True if model exists and all pricing values sum to zero
     """
     pricing = OpenRouterModelRegistry.spec(model_norm_id).get("pricing") or {}
+    coerce = OpenRouterModelRegistry._coerce_pricing_number
+    prompt = coerce(pricing.get("prompt"))
+    completion = coerce(pricing.get("completion"))
+    if (prompt is not None and not prompt.is_finite()) or (
+        completion is not None and not completion.is_finite()
+    ):
+        # Non-finite pricing (e.g. "nan"/"Infinity") is malformed: never free.
+        return False
+    if (prompt is not None and prompt < Decimal(0)) or (
+        completion is not None and completion < Decimal(0)
+    ):
+        # Selection-step sentinel pricing (e.g. -1/-1 on a router): never free.
+        return False
     total, numeric_count = sum_pricing_values(pricing)
     if numeric_count <= 0:
         return False
     return total == Decimal(0)
+
+
+def router_downstream_model_id(requested_model: Any, upstream_payload: Any) -> Optional[str]:
+    """Return the model OpenRouter reported serving a router request, if different.
+
+    Best-effort observability only: returns None when the requested model is not
+    a router, when the payload carries no usable ``model`` field, or when the
+    reported model is the requested one.
+    """
+    if not isinstance(upstream_payload, dict):
+        return None
+    requested = str(requested_model or "")
+    if not OpenRouterModelRegistry.is_router_model(requested):
+        return None
+    reported = upstream_payload.get("model")
+    if not isinstance(reported, str) or not reported.strip():
+        return None
+    reported = reported.strip()
+    if ModelFamily.base_model(reported) == ModelFamily.base_model(requested):
+        return None
+    return reported
 
 
 def supports_tool_calling(model_norm_id: str) -> bool:
