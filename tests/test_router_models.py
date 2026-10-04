@@ -120,7 +120,7 @@ NAN_PRICED_MODEL = {
 }
 
 
-async def _load_catalog(session=None, zdr=None) -> None:
+async def _load_catalog(session: Any = None, zdr=None) -> None:
     session = session or _CatalogSession(
         [ROUTER_MODEL, ZERO_PRICED_ROUTER, TILDE_ALIAS, CONCRETE_MODEL,
          FREE_CONCRETE_MODEL, NO_PRICING_MODEL, NAN_PRICED_MODEL],
@@ -421,7 +421,7 @@ async def test_router_preserves_explicit_effort():
     body = ResponsesBody(model="typesafe/jev-router", reasoning={"effort": "high"}, input=[])
     mgr._apply_reasoning_preferences(body, pipe.valves)
 
-    assert body.reasoning.get("effort") == "high"
+    assert (body.reasoning or {}).get("effort") == "high"
 
 
 @pytest.mark.asyncio
@@ -435,7 +435,7 @@ async def test_non_router_still_receives_valve_effort():
     body = ResponsesBody(model="openai/gpt-5", input=[])
     mgr._apply_reasoning_preferences(body, pipe.valves)
 
-    assert body.reasoning.get("effort") == "medium"
+    assert (body.reasoning or {}).get("effort") == "medium"
 
 
 @pytest.mark.asyncio
@@ -539,7 +539,7 @@ async def test_router_route_status_emitted_once():
             mock_http.get(
                 "https://openrouter.ai/api/v1/endpoints/zdr", payload={"data": []}, repeat=True
             )
-            result = await pipe.pipe(
+            result: Any = await pipe.pipe(
                 body={"model": "typesafe/jev-router",
                       "messages": [{"role": "user", "content": "hi"}], "stream": True},
                 __user__={"id": "user_123"},
