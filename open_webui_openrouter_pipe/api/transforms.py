@@ -34,7 +34,7 @@ from ..core.config import (
     _PROVIDER_SLUG_PATTERN,
 )
 from ..core.timing_logger import timed
-from ..models.registry import ModelFamily
+from ..models.registry import ModelFamily, parse_router_model_list_valve, router_plugin_id_for_model
 from ..tools.tool_schema import _strictify_schema
 from ..core.config import LOGGER
 from ..core.utils import _coerce_bool, _parse_model_fallback_csv, _sticky_session_key, strip_hidden_marker_lines
@@ -1399,6 +1399,55 @@ def _apply_disable_native_websearch_to_payload(
             "Native web search disabled via custom param (model=%s).",
             payload.get("model"),
         )
+
+
+# -- Router model selection lists --------------------------------------------
+
+def _apply_router_model_lists_to_payload(
+    responses_body: "ResponsesBody",
+    *,
+    valves: "Pipe.Valves",
+    logger: logging.Logger = LOGGER,
+) -> None:
+    """Attach admin router selection lists as a router plugin entry.
+
+    OpenRouter routers read ``allowed_models`` / ``excluded_models`` wildcard
+    patterns from a ``plugins`` entry keyed by the router's plugin id. Only
+    routers that accept the entry get one; unknown keys on other models would
+    be rejected upstream with a 400.
+    """
+    model_id = getattr(responses_body, "model", "")
+    plugin_id = router_plugin_id_for_model(model_id)
+    if plugin_id is None:
+        return
+
+    allowed = parse_router_model_list_valve(getattr(valves, "ROUTER_ALLOWED_MODELS", ""))
+    excluded = parse_router_model_list_valve(getattr(valves, "ROUTER_EXCLUDED_MODELS", ""))
+    if not allowed and not excluded:
+        return
+
+    entry: Dict[str, Any] = {"id": plugin_id}
+    if allowed:
+        entry["allowed_models"] = allowed
+    if excluded:
+        entry["excluded_models"] = excluded
+
+    plugins = list(getattr(responses_body, "plugins", None) or [])
+    for existing in plugins:
+        if isinstance(existing, dict) and existing.get("id") == plugin_id:
+            existing.update(entry)
+            break
+    else:
+        plugins.append(entry)
+    responses_body.plugins = plugins
+
+    logger.debug(
+        "Applied router model lists: model=%s plugin=%s allowed=%d excluded=%d",
+        model_id,
+        plugin_id,
+        len(allowed),
+        len(excluded),
+    )
 
 
 # -- Provider routing custom parameters --------------------------------------

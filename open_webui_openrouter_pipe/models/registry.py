@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 
 import aiohttp
 
-from ..core.config import _OPENROUTER_TITLE, _OPENROUTER_CATEGORIES, _OPENROUTER_REFERER
+from ..core.config import _OPENROUTER_TITLE, _OPENROUTER_CATEGORIES, _OPENROUTER_REFERER, LOGGER
 from .blocklists import is_direct_upload_blocklisted
 from ..core.timing_logger import timed
 
@@ -1159,6 +1159,71 @@ def router_is_zdr_opted_in(model_id: Any, valve_value: Any) -> bool:
     if not OpenRouterModelRegistry.is_router_model(str(model_id or "")):
         return False
     return _zdr_router_base_norm(model_id) in parse_zdr_router_valve(valve_value)
+
+
+# -----------------------------------------------------------------------------
+# Router Model Selection Helpers
+# -----------------------------------------------------------------------------
+
+# OpenRouter reads each router's selection lists under its own plugin id.
+_ROUTER_PLUGIN_IDS: Dict[str, str] = {
+    "typesafe.jev-router": "jev-router",
+    "openrouter.auto": "auto-router",
+    "openrouter.auto-beta": "auto-beta-router",
+}
+
+# Upstream limit per selection list (OpenRouter rejects longer lists).
+_ROUTER_MODEL_LIST_MAX_ENTRIES = 1024
+
+
+def parse_router_model_list_valve(
+    value: Any,
+    *,
+    logger: logging.Logger = LOGGER,
+) -> list[str]:
+    """Normalize a ROUTER_ALLOWED_MODELS / ROUTER_EXCLUDED_MODELS CSV into patterns.
+
+    Entries are OpenRouter router patterns (exact slug, wildcard such as
+    ``anthropic/*`` or ``*flash*``, or a ``~author/family-latest`` alias), so unlike
+    the ZDR opt-in valve they are preserved verbatim — never base-normalized.
+    """
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        entries = [str(entry) for entry in value]
+    else:
+        entries = _parse_model_patterns(value)
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        pattern = entry.strip()
+        if not pattern or pattern in seen:
+            continue
+        if any(ch.isspace() for ch in pattern):
+            logger.warning(
+                "Router model list entry contains whitespace; sending verbatim: %r",
+                pattern,
+            )
+        seen.add(pattern)
+        parsed.append(pattern)
+
+    if len(parsed) > _ROUTER_MODEL_LIST_MAX_ENTRIES:
+        logger.warning(
+            "Router model list has %d entries; truncating to OpenRouter's limit of %d",
+            len(parsed),
+            _ROUTER_MODEL_LIST_MAX_ENTRIES,
+        )
+        parsed = parsed[: _ROUTER_MODEL_LIST_MAX_ENTRIES]
+    return parsed
+
+
+def router_plugin_id_for_model(model_id: Any) -> Optional[str]:
+    """Return the OpenRouter selection-list plugin id for a router slug, else None."""
+    norm = _zdr_router_base_norm(model_id)
+    if not norm:
+        return None
+    return _ROUTER_PLUGIN_IDS.get(norm)
 
 
 # -----------------------------------------------------------------------------

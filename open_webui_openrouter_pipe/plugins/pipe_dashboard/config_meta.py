@@ -982,6 +982,16 @@ CONFIG_META: dict[str, dict[str, str]] = {
         "group": "Models & Catalog/ZDR",
         "detail": "Lets named Router-class models stay selectable while `Show only ZDR models` is on and keeps them callable under `Enforce ZDR routing`.\n\nRouter-class models (`typesafe/jev-router`, `openrouter/auto`, `openrouter/free`, and similar) serve a single id that picks a different downstream model per request. They expose no provider endpoints at all, so the published ZDR list never contains them and both ZDR controls would otherwise hide or reject them. Comma-separated router slug(s) to opt in (for example: `openrouter/auto`, `typesafe/jev-router`); a listed router is sent with `provider.zdr=true` under enforcement.\n\n**Warning:** This is best-effort. The ZDR guarantee covers the routing step only; the downstream model the router selects is a separate data path that OpenRouter does not promise is ZDR. Leave empty to keep the default conservative behaviour."
     },
+    "ROUTER_ALLOWED_MODELS": {
+        "title": "Router allowed models",
+        "group": "Models & Catalog/Routers",
+        "detail": "Narrows which downstream models a Router-class model may pick, so a hosted router only ever chooses from the families you trust.\n\nComma-separated patterns: exact slugs (`openai/gpt-5.1`), case-sensitive wildcards (`anthropic/*`, `openai/gpt-5*`, `*flash*`), or `~author/family-latest` aliases. Applies to `typesafe/jev-router` and `openrouter/auto` (including `auto-beta`); other models are untouched. Patterns only narrow the router's candidate pool — they never add models and do not change how it ranks what remains.\n\nEmpty means the router's full pool, which is the default. **Tip:** An allow list that matches nothing is ignored upstream (the router falls back to its whole pool), so treat this valve as a nudge toward your preferred families rather than a hard block."
+    },
+    "ROUTER_EXCLUDED_MODELS": {
+        "title": "Router excluded models",
+        "group": "Models & Catalog/Routers",
+        "detail": "Bans specific downstream models from a Router-class model's choice, so a router can never select a family you have ruled out.\n\nComma-separated patterns with the same syntax as `Router allowed models` (exact slugs, case-sensitive wildcards such as `openai/*` or `*preview*`, and `~` aliases). Applies to `typesafe/jev-router` and `openrouter/auto` (including `auto-beta`). Exclusions always win: a model matching both lists is still never picked.\n\nEmpty means nothing is banned, which is the default. **Warning:** Exclusions are never silently ignored, so if your patterns remove every candidate the router can use, the request fails with an OpenRouter `404` naming the lists to widen."
+    },
     "PIPE_DASHBOARD_ENABLE": {
         "title": "Enable Pipe Dashboard",
         "group": "Plugins/Pipe Dashboard",

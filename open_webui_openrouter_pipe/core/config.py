@@ -899,6 +899,26 @@ class Valves(BaseModel):
             "OpenRouter does not guarantee is ZDR."
         ),
     )
+    ROUTER_ALLOWED_MODELS: str = Field(
+        default="",
+        title="Router allowed models",
+        description=(
+            "Comma-separated wildcard patterns limiting which models a router may pick "
+            "(for example 'anthropic/*,openai/gpt-5*'). Applies to typesafe/jev-router and "
+            "openrouter/auto(-beta). Empty means the router's full pool. Excluded models win "
+            "over this list. An allow list that matches nothing is ignored upstream, so it "
+            "narrows rather than hard-blocks."
+        ),
+    )
+    ROUTER_EXCLUDED_MODELS: str = Field(
+        default="",
+        title="Router excluded models",
+        description=(
+            "Comma-separated wildcard patterns for models a router must never pick "
+            "(for example 'openai/*,*preview*'). Applies to typesafe/jev-router and "
+            "openrouter/auto(-beta). Exclusions are always honored, even against the allowed list."
+        ),
+    )
     VARIANT_MODELS: str = Field(
         default="",
         title="Variant models",
